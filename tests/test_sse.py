@@ -396,6 +396,62 @@ def test_format_sse_event_splitlines_behavior_in_comment():
     assert format_sse_event(comment="hi\n") == b": hi\n: \n\n"
 
 
+# Direct construction of EventSourceResponse (bounded channel parameters)
+
+
+def test_event_source_response_direct_bytes_and_disabled_ping():
+    """Pre-encoded bytes pass through and ping=None disables keepalives."""
+
+    async def raw_bytes():
+        yield b'data: {"n": 1}\n\n'
+        yield b'data: {"n": 2}\n\n'
+
+    direct_app = FastAPI()
+
+    @direct_app.get("/raw-sse")
+    async def raw_sse():
+        return EventSourceResponse(raw_bytes(), ping=None, max_buffer_size=4)
+
+    with TestClient(direct_app) as c:
+        response = c.get("/raw-sse")
+    assert response.status_code == 200
+    assert response.headers["content-type"] == "text/event-stream; charset=utf-8"
+    assert response.text == 'data: {"n": 1}\n\ndata: {"n": 2}\n\n'
+    assert ": ping" not in response.text
+
+
+def test_event_source_response_validates_parameters():
+    async def empty():
+        if False:  # pragma: no cover
+            yield b""
+
+    with pytest.raises(ValueError, match="max_buffer_size"):
+        EventSourceResponse(empty(), max_buffer_size=-1)
+    with pytest.raises(ValueError, match="ping"):
+        EventSourceResponse(empty(), ping=0)
+
+
+def test_event_source_response_custom_media_type():
+    """A subclass can override the media type and still stream SSE."""
+
+    class MySSE(EventSourceResponse):
+        media_type = "application/my-stream"
+
+    async def items():
+        yield {"n": 1}
+
+    custom_app = FastAPI()
+
+    @custom_app.get("/custom")
+    async def custom():
+        return MySSE(items(), ping=None)
+
+    with TestClient(custom_app) as c:
+        response = c.get("/custom")
+    assert response.headers["content-type"] == "application/my-stream"
+    assert 'data: {"n": 1}\n\n' == response.text
+
+
 # default_response_class tests
 
 

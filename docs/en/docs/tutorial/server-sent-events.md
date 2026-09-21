@@ -97,9 +97,27 @@ This is useful for sending pre-formatted text, log lines, or special <dfn title=
 
 When a browser reconnects after a connection drop, it sends the last received `id` in the `Last-Event-ID` header.
 
-You can read it as a header parameter and use it to resume the stream from where the client left off:
+You can read it as a header parameter and use it to resume the stream from where the client left off. FastAPI **never** reads this header or replays events automatically: the reconnection strategy is entirely under your control.
+
+Only replay events when your source supports it (a database query with an offset, an append-only log, a snapshot store, etc.). If you are streaming events that cannot be replayed, ignore `Last-Event-ID` or return an error — automatic re-consumption could duplicate side effects:
 
 {* ../../docs_src/server_sent_events/tutorial004_py310.py hl[25,27,31] *}
+
+## Disconnects, backpressure and resources { #disconnects-backpressure-and-resources }
+
+`EventSourceResponse` runs the endpoint generator in a separate **producer** task connected to the network writer through a **bounded channel**:
+
+* At most `max_buffer_size` events (16 by default) are buffered. When the client is slow to read — or the server's own downstream `send` is blocked — the endpoint generator is paused instead of accumulating events in memory forever.
+* When the client disconnects, the producer is cancelled at its next `await`, the async generator receives `GeneratorExit`, and `try/finally` blocks (including dependencies that use `yield`, such as database sessions) run promptly. The size of the queue is therefore bounded both for finite and for infinite streams.
+* A regular `def` generator is iterated in a **worker thread**, so it never blocks the event loop. A blocking synchronous generator cannot be interrupted in the middle of an iteration: after a disconnect it is stopped at its next iteration point, once the current blocking step returns. Keep iterations short or use an `async def` generator for prompt cancellation.
+* An exception raised by the endpoint generator is propagated out of the response; background tasks run only after the whole stream was delivered successfully, never after a disconnect.
+* You can pass `ping=None` to disable keep-alive comments, or change the interval and the buffer size:
+
+```Python
+EventSourceResponse(events(), ping=30, max_buffer_size=64)
+```
+
+You normally don't construct the response yourself, but the same limits apply when you use `response_class=EventSourceResponse`.
 
 ## SSE with POST { #sse-with-post }
 

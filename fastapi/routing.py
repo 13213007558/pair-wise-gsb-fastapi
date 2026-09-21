@@ -41,7 +41,6 @@ from typing import (
 
 import anyio
 from annotated_doc import Doc
-from anyio.abc import ObjectReceiveStream
 from fastapi import params
 from fastapi._compat import (
     ModelField,
@@ -76,9 +75,9 @@ from fastapi.exceptions import (
 )
 from fastapi.sse import (
     _PING_INTERVAL,
-    KEEPALIVE_COMMENT,
     EventSourceResponse,
     ServerSentEvent,
+    encode_server_sent_event,
     format_sse_event,
 )
 from fastapi.types import DecoratedCallable, IncEx
@@ -91,7 +90,7 @@ from fastapi.utils import (
 from starlette import routing
 from starlette._exception_handler import wrap_app_handling_exceptions
 from starlette._utils import get_route_path, is_async_callable
-from starlette.concurrency import iterate_in_threadpool, run_in_threadpool
+from starlette.concurrency import run_in_threadpool
 from starlette.datastructures import URL, FormData, URLPath
 from starlette.exceptions import HTTPException
 from starlette.requests import Request
@@ -518,126 +517,33 @@ def get_request_handler(
                     return json.dumps(data).encode("utf-8")
 
             if is_sse_stream:
-                # Generator endpoint: stream as Server-Sent Events
+                # Generator endpoint: stream as Server-Sent Events. The
+                # bounded channel, keepalive insertion, disconnect
+                # cancellation and wire writing all live in
+                # EventSourceResponse; we pass it the raw endpoint
+                # generator and an item encoder so that client disconnect
+                # cancels the endpoint generator directly (finalizing its
+                # `try/finally` blocks and `yield` dependencies) instead of
+                # an intermediate wrapper generator.
                 gen = dependant.call(**solved_result.values)
 
                 def _serialize_sse_item(item: Any) -> bytes:
                     if isinstance(item, ServerSentEvent):
-                        # User controls the event structure.
-                        # Serialize the data payload if present.
                         # For ServerSentEvent items we skip stream_item_field
                         # validation (the user may mix types intentionally).
-                        if item.raw_data is not None:
-                            data_str: str | None = item.raw_data
-                        elif item.data is not None:
-                            if hasattr(item.data, "model_dump_json"):
-                                data_str = item.data.model_dump_json()
-                            else:
-                                data_str = json.dumps(jsonable_encoder(item.data))
-                        else:
-                            data_str = None
-                        return format_sse_event(
-                            data_str=data_str,
-                            event=item.event,
-                            id=item.id,
-                            retry=item.retry,
-                            comment=item.comment,
-                        )
+                        return encode_server_sent_event(item)
                     else:
                         # Plain object: validate + serialize via
                         # stream_item_field (if set) and wrap in data field
-                        return format_sse_event(
-                            data_str=_serialize_data(item).decode("utf-8")
-                        )
-
-                if _is_async_gen_callable(dependant.call):
-                    sse_aiter: AsyncIterator[Any] = gen.__aiter__()
-                else:
-                    sse_aiter = iterate_in_threadpool(gen)
-
-                @asynccontextmanager
-                async def _sse_producer_cm() -> AsyncIterator[
-                    ObjectReceiveStream[bytes]
-                ]:
-                    # Use a memory stream to decouple generator iteration
-                    # from the keepalive timer. A producer task pulls items
-                    # from the generator independently, so
-                    # `anyio.fail_after` never wraps the generator's
-                    # `__anext__` directly - avoiding CancelledError that
-                    # would finalize the generator and also working for sync
-                    # generators running in a thread pool.
-                    #
-                    # This context manager is entered on the request-scoped
-                    # AsyncExitStack so its __aexit__ (which cancels the
-                    # task group) is called by the exit stack after the
-                    # streaming response completes — not by async generator
-                    # finalization via GeneratorExit.
-                    # Ref: https://peps.python.org/pep-0789/
-                    send_stream, receive_stream = anyio.create_memory_object_stream[
-                        bytes
-                    ](max_buffer_size=1)
-
-                    async def _producer() -> None:
-                        async with send_stream:
-                            async for raw_item in sse_aiter:
-                                await send_stream.send(_serialize_sse_item(raw_item))
-
-                    send_keepalive, receive_keepalive = (
-                        anyio.create_memory_object_stream[bytes](max_buffer_size=1)
-                    )
-
-                    async def _keepalive_inserter() -> None:
-                        """Read from the producer and forward to the output,
-                        inserting keepalive comments on timeout."""
-                        async with send_keepalive, receive_stream:
-                            try:
-                                while True:
-                                    try:
-                                        with anyio.fail_after(_PING_INTERVAL):
-                                            data = await receive_stream.receive()
-                                        await send_keepalive.send(data)
-                                    except TimeoutError:
-                                        await send_keepalive.send(KEEPALIVE_COMMENT)
-                            except anyio.EndOfStream:
-                                pass
-
-                    async with anyio.create_task_group() as tg:
-                        tg.start_soon(_producer)
-                        tg.start_soon(_keepalive_inserter)
-                        yield receive_keepalive
-                        tg.cancel_scope.cancel()
-
-                # Enter the SSE context manager on the request-scoped
-                # exit stack. The stack outlives the streaming response,
-                # so __aexit__ runs via proper structured teardown, not
-                # via GeneratorExit thrown into an async generator.
-                sse_receive_stream = await async_exit_stack.enter_async_context(
-                    _sse_producer_cm()
-                )
-                # Ensure the receive stream is closed when the exit stack
-                # unwinds, preventing ResourceWarning from __del__.
-                async_exit_stack.push_async_callback(sse_receive_stream.aclose)
-
-                async def _sse_with_checkpoints(
-                    stream: ObjectReceiveStream[bytes],
-                ) -> AsyncIterator[bytes]:
-                    async for data in stream:
-                        yield data
-                        # Guarantee a checkpoint so cancellation can be
-                        # delivered even when the producer is faster than
-                        # the consumer and receive() never suspends.
-                        await anyio.sleep(0)
-
-                sse_stream_content: AsyncIterator[bytes] | Iterator[bytes] = (
-                    _sse_with_checkpoints(sse_receive_stream)
-                )
+                        return format_sse_event(data_str=_serialize_data(item).decode())
 
                 response_args = _build_response_args(
                     status_code=status_code, solved_result=solved_result
                 )
-                response = StreamingResponse(
-                    sse_stream_content,
-                    media_type="text/event-stream",
+                response = actual_response_class(
+                    gen,
+                    encode=_serialize_sse_item,
+                    ping=_PING_INTERVAL,
                     **response_args,
                 )
                 response.headers["Cache-Control"] = "no-cache"
