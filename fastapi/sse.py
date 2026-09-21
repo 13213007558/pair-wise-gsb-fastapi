@@ -239,3 +239,11 @@ KEEPALIVE_COMMENT = b": ping\n\n"
 # Seconds between keep-alive pings when a generator is idle.
 # Private but importable so tests can monkeypatch it.
 _PING_INTERVAL: float = 15.0
+
+# Maximum number of events buffered in each internal hand-off channel
+# (generator -> keep-alive inserter -> ASGI sender). When the client
+# disconnects or the downstream send() is slow, backpressure stops the
+# producer after at most this many queued events per stage instead of
+# letting an infinite generator queue events unboundedly.
+# Private but importable so tests can monkeypatch it.
+_SSE_MAX_QUEUE_SIZE: int = 1

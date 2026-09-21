@@ -76,6 +76,7 @@ from fastapi.exceptions import (
 )
 from fastapi.sse import (
     _PING_INTERVAL,
+    _SSE_MAX_QUEUE_SIZE,
     KEEPALIVE_COMMENT,
     EventSourceResponse,
     ServerSentEvent,
@@ -91,7 +92,7 @@ from fastapi.utils import (
 from starlette import routing
 from starlette._exception_handler import wrap_app_handling_exceptions
 from starlette._utils import get_route_path, is_async_callable
-from starlette.concurrency import iterate_in_threadpool, run_in_threadpool
+from starlette.concurrency import run_in_threadpool
 from starlette.datastructures import URL, FormData, URLPath
 from starlette.exceptions import HTTPException
 from starlette.requests import Request
@@ -354,6 +355,11 @@ async def run_endpoint_function(
         return await run_in_threadpool(dependant.call, **values)
 
 
+# Sentinel marking exhaustion of a sync SSE generator (StopIteration
+# cannot propagate through anyio.to_thread worker results).
+_SSE_SYNC_SENTINEL: Any = object()
+
+
 def _build_response_args(
     *, status_code: int | None, solved_result: Any
 ) -> dict[str, Any]:
@@ -553,7 +559,37 @@ def get_request_handler(
                 if _is_async_gen_callable(dependant.call):
                     sse_aiter: AsyncIterator[Any] = gen.__aiter__()
                 else:
-                    sse_aiter = iterate_in_threadpool(gen)
+                    # Sync generators run in a worker thread (never on
+                    # the event loop). Track when a next() call is in
+                    # flight so teardown can close the generator
+                    # deterministically instead of racing the thread.
+                    sync_gen_idle = threading.Event()
+                    sync_gen_idle.set()
+
+                    def _next_sync_item() -> Any:
+                        sync_gen_idle.clear()
+                        try:
+                            return next(gen)
+                        except StopIteration:
+                            return _SSE_SYNC_SENTINEL
+                        finally:
+                            sync_gen_idle.set()
+
+                    async def _iterate_sync_gen() -> AsyncIterator[Any]:
+                        while True:
+                            item = await anyio.to_thread.run_sync(_next_sync_item)
+                            if item is _SSE_SYNC_SENTINEL:
+                                break
+                            yield item
+
+                    sse_aiter = _iterate_sync_gen()
+
+                # Set (exactly once) if the producer task fails, e.g. the
+                # endpoint generator or the item serializer raised. The
+                # consumer re-raises it after the stream drains so the
+                # error aborts the response instead of being silently
+                # dropped by the task-group teardown.
+                producer_error: list[Exception] = []
 
                 @asynccontextmanager
                 async def _sse_producer_cm() -> AsyncIterator[
@@ -567,6 +603,11 @@ def get_request_handler(
                     # would finalize the generator and also working for sync
                     # generators running in a thread pool.
                     #
+                    # The channels are bounded (_SSE_MAX_QUEUE_SIZE): if the
+                    # client disconnects or the downstream send() is slow,
+                    # backpressure stops the producer instead of letting an
+                    # infinite generator queue events unboundedly.
+                    #
                     # This context manager is entered on the request-scoped
                     # AsyncExitStack so its __aexit__ (which cancels the
                     # task group) is called by the exit stack after the
@@ -575,15 +616,59 @@ def get_request_handler(
                     # Ref: https://peps.python.org/pep-0789/
                     send_stream, receive_stream = anyio.create_memory_object_stream[
                         bytes
-                    ](max_buffer_size=1)
+                    ](max_buffer_size=_SSE_MAX_QUEUE_SIZE)
+
+                    async def _close_source_generator() -> None:
+                        # Deterministically release resources held by the
+                        # endpoint generator (e.g. `async with` blocks,
+                        # try/finally) instead of waiting for garbage
+                        # collection. Shielded so the cleanup runs to
+                        # completion even while the producer task is being
+                        # cancelled on client disconnect.
+                        if _is_async_gen_callable(dependant.call):
+                            with anyio.CancelScope(shield=True):
+                                await gen.aclose()
+                        else:
+                            # A sync generator may still be executing
+                            # next() in a worker thread. Wait (bounded)
+                            # for it to become idle so close() delivers
+                            # GeneratorExit deterministically; if the
+                            # thread is blocked indefinitely, closing is
+                            # best-effort and left to garbage collection.
+                            with anyio.CancelScope(shield=True):
+                                with anyio.move_on_after(1):
+                                    await anyio.to_thread.run_sync(sync_gen_idle.wait)
+                            with contextlib.suppress(ValueError, RuntimeError):
+                                gen.close()
 
                     async def _producer() -> None:
-                        async with send_stream:
-                            async for raw_item in sse_aiter:
-                                await send_stream.send(_serialize_sse_item(raw_item))
+                        try:
+                            async with send_stream:
+                                async for raw_item in sse_aiter:
+                                    await send_stream.send(
+                                        _serialize_sse_item(raw_item)
+                                    )
+                        except anyio.get_cancelled_exc_class():
+                            raise
+                        except (anyio.BrokenResourceError, anyio.ClosedResourceError):
+                            # The receiving end was closed during teardown
+                            # (e.g. client disconnect); treat it as a
+                            # normal shutdown, not a producer failure.
+                            pass
+                        except Exception as exc:
+                            # Record the failure for the consumer side and
+                            # close the channel normally, so the task group
+                            # doesn't re-raise it during teardown and the
+                            # error surfaces exactly once, on the response
+                            # path.
+                            producer_error.append(exc)
+                        finally:
+                            await _close_source_generator()
 
                     send_keepalive, receive_keepalive = (
-                        anyio.create_memory_object_stream[bytes](max_buffer_size=1)
+                        anyio.create_memory_object_stream[bytes](
+                            max_buffer_size=_SSE_MAX_QUEUE_SIZE
+                        )
                     )
 
                     async def _keepalive_inserter() -> None:
@@ -598,14 +683,36 @@ def get_request_handler(
                                         await send_keepalive.send(data)
                                     except TimeoutError:
                                         await send_keepalive.send(KEEPALIVE_COMMENT)
-                            except anyio.EndOfStream:
+                            except (
+                                anyio.EndOfStream,
+                                anyio.BrokenResourceError,
+                                anyio.ClosedResourceError,
+                            ):
+                                # Producer finished, or the output channel
+                                # was closed during teardown (e.g. client
+                                # disconnect). Either way, stop forwarding.
                                 pass
 
                     async with anyio.create_task_group() as tg:
                         tg.start_soon(_producer)
                         tg.start_soon(_keepalive_inserter)
-                        yield receive_keepalive
+                        # An exception from the response body (e.g. a
+                        # producer error re-raised on the consumer side)
+                        # is thrown into this context manager at the
+                        # yield. Capture it and re-raise it *outside* the
+                        # task group, so anyio doesn't wrap it in an
+                        # ExceptionGroup and the original error (and its
+                        # type) reaches the ASGI server unchanged.
+                        body_error: list[BaseException] = []
+                        try:
+                            yield receive_keepalive
+                        except GeneratorExit:
+                            raise
+                        except BaseException as exc:
+                            body_error.append(exc)
                         tg.cancel_scope.cancel()
+                    if body_error:
+                        raise body_error[0]
 
                 # Enter the SSE context manager on the request-scoped
                 # exit stack. The stack outlives the streaming response,
@@ -627,6 +734,12 @@ def get_request_handler(
                         # delivered even when the producer is faster than
                         # the consumer and receive() never suspends.
                         await anyio.sleep(0)
+                    if producer_error:
+                        # The endpoint generator or serializer failed.
+                        # Surface the error on the response path (aborting
+                        # the stream) instead of letting the client see a
+                        # clean, silently truncated end of stream.
+                        raise producer_error[0]
 
                 sse_stream_content: AsyncIterator[bytes] | Iterator[bytes] = (
                     _sse_with_checkpoints(sse_receive_stream)
@@ -635,11 +748,10 @@ def get_request_handler(
                 response_args = _build_response_args(
                     status_code=status_code, solved_result=solved_result
                 )
-                response = StreamingResponse(
-                    sse_stream_content,
-                    media_type="text/event-stream",
-                    **response_args,
-                )
+                # Instantiate the configured response class (a subclass of
+                # EventSourceResponse) so a custom media_type or custom
+                # response behavior is honored.
+                response = actual_response_class(sse_stream_content, **response_args)
                 response.headers["Cache-Control"] = "no-cache"
                 # For Nginx proxies to not buffer server sent events
                 response.headers["X-Accel-Buffering"] = "no"

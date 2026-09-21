@@ -101,6 +101,14 @@ You can read it as a header parameter and use it to resume the stream from where
 
 {* ../../docs_src/server_sent_events/tutorial004_py310.py hl[25,27,31] *}
 
+/// note
+
+FastAPI never replays or skips events automatically based on `Last-Event-ID`.
+
+Many event sources (e.g. a live queue or a database change stream) cannot be replayed safely, so the reconnection strategy is always up to your application: read the header and decide explicitly what (if anything) to re-send.
+
+///
+
 ## SSE with POST { #sse-with-post }
 
 SSE works with **any HTTP method**, not just `GET`.
@@ -118,3 +126,27 @@ FastAPI implements some SSE best practices out of the box.
 * Set a special header `X-Accel-Buffering: no` to **prevent buffering** in some proxies like Nginx.
 
 You don't have to do anything about it, it works out of the box. 🤓
+
+### Backpressure and Disconnects { #backpressure-and-disconnects }
+
+Events are handed from your generator to the ASGI server through **bounded in-memory channels**.
+
+If the client is slow to consume events, or disconnects, the producer stops instead of queuing events unboundedly — this also works for **infinite generators**.
+
+When the stream ends (normally, on client disconnect, or on error), FastAPI **closes the endpoint generator deterministically**, so resources it holds (e.g. `async with` blocks, `try`/`finally` cleanup) are released promptly, together with any [dependencies with `yield`](dependencies/dependencies-with-yield.md).
+
+Synchronous (`def`) generators are iterated in a **worker thread**, so they never block the event loop.
+
+### Custom Media Type { #custom-media-type }
+
+If you need a custom media type (while keeping the SSE wire format), subclass `EventSourceResponse`:
+
+```Python
+from fastapi.sse import EventSourceResponse
+
+
+class CustomEventStreamResponse(EventSourceResponse):
+    media_type = "text/x-custom-event-stream"
+```
+
+and use it as the `response_class` of your *path operation*.
