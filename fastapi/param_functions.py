@@ -2314,7 +2314,7 @@ def Depends(  # noqa: N802
         ),
     ] = True,
     scope: Annotated[
-        Literal["function", "request"] | None,
+        Literal["function", "request", "uncached"] | None,
         Doc(
             """
             Mainly for dependencies with `yield`, define when the dependency function
@@ -2330,6 +2330,11 @@ def Depends(  # noqa: N802
                 that handles the request (similar to when using `"function"`), but end
                 **after** the response is sent back to the client. So, the dependency
                 function will be executed **around** the **request** and response cycle.
+            * `"uncached"`: the dependency is **not cached**, it is executed again
+                for every place it is declared in the same request (each declaration
+                gets its own value). For dependencies with `yield`, the exit timing
+                is the same as `"request"`: the code after `yield` runs **after**
+                the response is sent back to the client.
 
             Read more about it in the
             [FastAPI docs for FastAPI Dependencies with yield](https://fastapi.tiangolo.com/tutorial/dependencies/dependencies-with-yield/#early-exit-and-scope)

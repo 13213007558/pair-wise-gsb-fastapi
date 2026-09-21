@@ -196,14 +196,15 @@ But if you know that you won't need to use the dependency after returning from t
 
 * `"function"`: start the dependency before the *path operation function* that handles the request, end the dependency after the *path operation function* ends, but **before** the response is sent back to the client. So, the dependency function will be executed **around** the *path operation **function***.
 * `"request"`: start the dependency before the *path operation function* that handles the request (similar to when using `"function"`), but end **after** the response is sent back to the client. So, the dependency function will be executed **around** the **request** and response cycle.
+* `"uncached"`: the dependency is **not cached**, it is executed again for every place it is declared in the same request, so each declaration gets its own value. For dependencies with `yield`, the exit timing is the same as `"request"`: the exit code runs **after** the response is sent back to the client.
 
 If not specified and the dependency has `yield`, it will have a `scope` of `"request"` by default.
 
 ### `scope` for sub-dependencies { #scope-for-sub-dependencies }
 
-When you declare a dependency with a `scope="request"` (the default), any sub-dependency needs to also have a `scope` of `"request"`.
+When you declare a dependency with a `scope="request"` (the default) or `scope="uncached"`, any sub-dependency needs to also have a `scope` of `"request"` or `"uncached"`.
 
-But a dependency with `scope` of `"function"` can have dependencies with `scope` of `"function"` and `scope` of `"request"`.
+But a dependency with `scope` of `"function"` can have dependencies with `scope` of `"function"`, `scope` of `"request"`, and `scope` of `"uncached"`.
 
 This is because any dependency needs to be able to run its exit code before the sub-dependencies, as it might need to still use them during its exit code.
 

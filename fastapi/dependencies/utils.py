@@ -276,7 +276,7 @@ def get_dependant(
     own_oauth_scopes: list[str] | None = None,
     parent_oauth_scopes: list[str] | None = None,
     use_cache: bool = True,
-    scope: Literal["function", "request"] | None = None,
+    scope: Literal["function", "request", "uncached"] | None = None,
 ) -> Dependant:
     dependant = Dependant(
         call=call,
@@ -301,19 +301,26 @@ def get_dependant(
         )
         if param_details.depends is not None:
             assert param_details.depends.dependency
+            computed_scope = _get_computed_scope(dependant=dependant)
             if (
                 (
                     _is_gen_callable(dependant.call)
                     or _is_async_gen_callable(dependant.call)
                 )
-                and _get_computed_scope(dependant=dependant) == "request"
+                # Dependencies that exit at the request scope (after the response
+                # is sent) cannot depend on dependencies that exit earlier, at
+                # the function scope. This includes dependencies with an explicit
+                # "request" scope, "uncached" dependencies, and dependencies with
+                # yield that use the default ("request") scope.
+                and computed_scope in ("request", "uncached")
                 and param_details.depends.scope == "function"
             ):
                 assert dependant.call
                 call_name = getattr(dependant.call, "__name__", "<unnamed_callable>")
                 raise DependencyScopeError(
                     f'The dependency "{call_name}" has a scope of '
-                    '"request", it cannot depend on dependencies with scope "function".'
+                    f'"{computed_scope}", it cannot depend on dependencies with '
+                    'scope "function".'
                 )
             sub_own_oauth_scopes: list[str] = []
             if isinstance(param_details.depends, params.Security):
@@ -657,7 +664,12 @@ async def solve_dependencies(
             dependant=sub_dependant,
             uses_scopes_cache=_uses_scopes_cache,
         )
-        if sub_dependant.use_cache and sub_dependant_cache_key in dependency_cache:
+        is_uncached = sub_dependant.scope == "uncached"
+        if (
+            not is_uncached
+            and sub_dependant.use_cache
+            and sub_dependant_cache_key in dependency_cache
+        ):
             solved = dependency_cache[sub_dependant_cache_key]
         elif _is_gen_callable(use_sub_dependant.call) or _is_async_gen_callable(
             use_sub_dependant.call
@@ -676,7 +688,7 @@ async def solve_dependencies(
             solved = await run_in_threadpool(call, **solved_result.values)
         if sub_dependant.name is not None:
             values[sub_dependant.name] = solved
-        if sub_dependant_cache_key not in dependency_cache:
+        if not is_uncached and sub_dependant_cache_key not in dependency_cache:
             dependency_cache[sub_dependant_cache_key] = solved
     path_values, path_errors = request_params_to_args(
         dependant.path_params, request.path_params
