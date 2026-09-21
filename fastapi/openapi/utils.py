@@ -30,7 +30,7 @@ from fastapi.dependencies.utils import (
     get_validation_alias,
 )
 from fastapi.encoders import jsonable_encoder
-from fastapi.exceptions import FastAPIDeprecationWarning
+from fastapi.exceptions import FastAPIDeprecationWarning, FastAPIError
 from fastapi.openapi.constants import METHODS_WITH_BODY, REF_PREFIX
 from fastapi.openapi.models import OpenAPI
 from fastapi.params import Body, ParamTypes
@@ -263,6 +263,52 @@ def get_openapi_operation_request_body(
     return request_body_oai
 
 
+def _get_openapi_callbacks(
+    *,
+    route: routing._APIRouteLike,
+    operation_ids: set[str],
+    model_name_map: ModelNameMap,
+    field_mapping: dict[
+        tuple[ModelField, Literal["validation", "serialization"]], dict[str, Any]
+    ],
+    separate_input_output_schemas: bool = True,
+) -> tuple[dict[str, Any], dict[str, Any], dict[str, Any]]:
+    callbacks: dict[str, Any] = {}
+    security_schemes: dict[str, Any] = {}
+    definitions: dict[str, Any] = {}
+    for callback in route.callbacks or []:
+        if not isinstance(callback, routing.APIRoute):
+            continue
+        cb_path, cb_security_schemes, cb_definitions = get_openapi_path(
+            route=cast(routing._APIRouteLike, callback),
+            operation_ids=operation_ids,
+            model_name_map=model_name_map,
+            field_mapping=field_mapping,
+            separate_input_output_schemas=separate_input_output_schemas,
+        )
+        if not cb_path:
+            continue
+        callback_key = callback.name
+        if callback_key in callbacks:
+            endpoint_name = getattr(route.endpoint, "__name__", "<unnamed_endpoint>")
+            file_name = getattr(route.endpoint, "__globals__", {}).get("__file__")
+            location = f" for endpoint {endpoint_name}"
+            if file_name:
+                location += f" at {file_name}"
+            raise FastAPIError(
+                f"Duplicate callback name {callback_key!r} on path "
+                f"{route.path_format!r}{location}. Callback routes must have "
+                "unique names within the same operation, including callbacks "
+                "inherited from an included router. The conflicting callback "
+                "path is "
+                f"{callback.path_format!r}."
+            )
+        callbacks[callback_key] = {callback.path_format: cb_path}
+        security_schemes.update(cb_security_schemes)
+        definitions.update(cb_definitions)
+    return callbacks, security_schemes, definitions
+
+
 def generate_operation_id(
     *, route: routing._APIRouteLike, method: str
 ) -> str:  # pragma: nocover
@@ -340,7 +386,25 @@ def get_openapi_path(
             )
             for field in _get_flat_fields_from_params(fields)
         ]
-        for method in route.methods:
+        # Callbacks are shared across all methods of the operation. Build them
+        # once so that callback operation IDs, security schemes and definitions
+        # are registered exactly once and don't leak between methods.
+        operation_callbacks: dict[str, Any] | None = None
+        if route.callbacks:
+            (
+                operation_callbacks,
+                callback_security_schemes,
+                callback_definitions,
+            ) = _get_openapi_callbacks(
+                route=route,
+                operation_ids=operation_ids,
+                model_name_map=model_name_map,
+                field_mapping=field_mapping,
+                separate_input_output_schemas=separate_input_output_schemas,
+            )
+            security_schemes.update(callback_security_schemes)
+            definitions.update(callback_definitions)
+        for method in sorted(route.methods):
             operation = get_openapi_operation_metadata(
                 route=route, method=method, operation_ids=operation_ids
             )
@@ -384,22 +448,10 @@ def get_openapi_path(
                 if request_body_oai:
                     operation["requestBody"] = request_body_oai
             if route.callbacks:
-                callbacks = {}
-                for callback in route.callbacks:
-                    if isinstance(callback, routing.APIRoute):
-                        (
-                            cb_path,
-                            cb_security_schemes,
-                            cb_definitions,
-                        ) = get_openapi_path(
-                            route=cast(routing._APIRouteLike, callback),
-                            operation_ids=operation_ids,
-                            model_name_map=model_name_map,
-                            field_mapping=field_mapping,
-                            separate_input_output_schemas=separate_input_output_schemas,
-                        )
-                        callbacks[callback.name] = {callback.path: cb_path}
-                operation["callbacks"] = callbacks
+                # Give each method an independent copy so openapi_extra
+                # processing (deep_dict_update) cannot pollute sibling methods.
+                if operation_callbacks is not None:
+                    operation["callbacks"] = copy.deepcopy(operation_callbacks)
             if route.status_code is not None:
                 status_code = str(route.status_code)
             else:
