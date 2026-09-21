@@ -1160,7 +1160,37 @@ class FastAPI(Starlette):
     async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
         if self.root_path:
             scope["root_path"] = self.root_path
+        if scope["type"] in ("http", "websocket"):
+            self._normalize_scope_root_path(scope)
         await super().__call__(scope, receive, send)
+
+    def _normalize_scope_root_path(self, scope: Scope) -> None:
+        """
+        Make the scope path consistent with the root_path.
+
+        ASGI servers (and proxies) are expected to keep the root_path prefix
+        in the path, but when FastAPI's own root_path parameter is used, the
+        proxy strips the prefix before forwarding, so the path doesn't
+        include it. Normalize the scope so the path always includes the
+        root_path prefix: routing strips it again to match routes, and
+        redirects, mounts, and URL generation all see a single consistent
+        representation instead of a mix of the two conventions.
+        """
+        root_path = scope.get("root_path", "")
+        if not root_path or not isinstance(root_path, str):
+            return
+        root_path = root_path.rstrip("/")
+        if not root_path:
+            scope["root_path"] = ""
+            return
+        scope["root_path"] = root_path
+        path = scope["path"]
+        if path == root_path or path.startswith(root_path + "/"):
+            return
+        scope["path"] = root_path + path
+        raw_path = scope.get("raw_path")
+        if isinstance(raw_path, bytes):
+            scope["raw_path"] = root_path.encode("utf-8") + raw_path
 
     def add_api_route(
         self,

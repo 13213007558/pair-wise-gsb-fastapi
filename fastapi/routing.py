@@ -873,6 +873,68 @@ class _RouteWithPath(Protocol):
     path: str
 
 
+def _get_scope_root_path(scope: Scope) -> str:
+    """
+    Root path the application is mounted at, normalized without a trailing
+    slash, so it can be concatenated with a route path directly.
+
+    Returns "" when no root_path is set or when it is just "/".
+    """
+    root_path = scope.get("root_path", "")
+    if not isinstance(root_path, str):
+        return ""
+    return root_path.rstrip("/")
+
+
+def _get_route_path(scope: Scope) -> str:
+    """
+    Path of the request relative to the root_path.
+
+    Like Starlette's get_route_path(), but tolerant of a root_path with a
+    trailing slash, and of scopes where the path doesn't include the
+    root_path prefix (e.g. when a proxy strips the prefix before forwarding,
+    which is the FastAPI root_path use case).
+    """
+    path: str = scope["path"]
+    root_path = _get_scope_root_path(scope)
+    if not root_path:
+        return path
+    if path == root_path:
+        return ""
+    if path.startswith(root_path + "/"):
+        return path[len(root_path) :]
+    return path
+
+
+def _get_external_path(scope: Scope, route_path: str) -> str:
+    """
+    External URL path for a route path, including the root_path prefix.
+
+    This is the inverse of _get_route_path(): it rebuilds the path as seen
+    by clients outside of the proxy/mount that set the root_path, so
+    redirects keep the prefix instead of dropping it.
+    """
+    root_path = _get_scope_root_path(scope)
+    if not root_path:
+        return route_path
+    if route_path == root_path or route_path.startswith(root_path + "/"):
+        # The path already includes the root_path prefix.
+        return route_path
+    return root_path + route_path
+
+
+def _can_send_websocket_redirect(scope: Scope) -> bool:
+    """
+    Whether a WebSocket redirect can be sent as an HTTP response.
+
+    WebSocket handshakes can only be redirected before the connection is
+    accepted, and only when the server supports the
+    "websocket.http.response" extension (denial response). Otherwise the
+    connection is rejected with the default close behavior.
+    """
+    return "websocket.http.response" in scope.get("extensions", {})
+
+
 def _get_fastapi_scope(scope: Scope) -> dict[str, Any]:
     fastapi_scope = scope.setdefault(_FASTAPI_SCOPE_KEY, {})
     assert isinstance(fastapi_scope, dict)
@@ -1952,10 +2014,11 @@ class _FrontendStaticFiles(StaticFiles):
         static_resource = await self._lookup_static_resource(path)
         if static_resource is not None:
             full_path, stat_result, is_directory_index = static_resource
-            if is_directory_index and not scope["path"].endswith("/"):
+            route_path = _get_route_path(scope)
+            if is_directory_index and not route_path.endswith("/"):
                 url = URL(scope=scope)
-                url = url.replace(path=url.path + "/")
-                return RedirectResponse(url=url)
+                url = url.replace(path=_get_external_path(scope, route_path + "/"))
+                return RedirectResponse(url=url, status_code=307)
             return self.file_response(full_path, stat_result, scope)
 
         if self.fallback == "404.html" or (
@@ -2742,19 +2805,30 @@ class APIRouter(routing.Router):
             await route.handle(scope, receive, send)
             return
 
-        route_path = get_route_path(scope)
-        if scope["type"] == "http" and self.redirect_slashes and route_path != "/":
+        route_path = _get_route_path(scope)
+        # WebSocket connections can only be redirected as an HTTP denial
+        # response, before the connection is accepted, and only if the
+        # server supports the "websocket.http.response" extension.
+        redirectable = scope["type"] == "http" or (
+            scope["type"] == "websocket" and _can_send_websocket_redirect(scope)
+        )
+        if redirectable and self.redirect_slashes and route_path != "/":
             redirect_scope = dict(scope)
             if route_path.endswith("/"):
-                redirect_scope["path"] = redirect_scope["path"].rstrip("/")
+                redirect_route_path = route_path.rstrip("/")
             else:
-                redirect_scope["path"] = redirect_scope["path"] + "/"
+                redirect_route_path = route_path + "/"
+            # Build the redirect path from the scope components (root_path
+            # included), never by string-replacing the URL, so the proxy
+            # prefix is preserved. The query string is kept as-is through
+            # the scope, and 307 preserves the method and body semantics.
+            redirect_scope["path"] = _get_external_path(scope, redirect_route_path)
 
             for route in self.routes:
                 match, _ = route.matches(redirect_scope)
                 if match != Match.NONE:
                     redirect_url = URL(scope=redirect_scope)
-                    response = RedirectResponse(url=str(redirect_url))
+                    response = RedirectResponse(url=str(redirect_url), status_code=307)
                     await response(scope, receive, send)
                     return
 
