@@ -2,7 +2,7 @@ import copy
 import http.client
 import inspect
 import warnings
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
 from dataclasses import dataclass, field
 from typing import Any, Literal, cast
 
@@ -30,7 +30,7 @@ from fastapi.dependencies.utils import (
     get_validation_alias,
 )
 from fastapi.encoders import jsonable_encoder
-from fastapi.exceptions import FastAPIDeprecationWarning
+from fastapi.exceptions import FastAPIDeprecationWarning, FastAPIError
 from fastapi.openapi.constants import METHODS_WITH_BODY, REF_PREFIX
 from fastapi.openapi.models import OpenAPI
 from fastapi.params import Body, ParamTypes
@@ -284,6 +284,18 @@ def generate_operation_summary(*, route: routing._APIRouteLike, method: str) -> 
     return route.name.replace("_", " ").title()
 
 
+def _get_endpoint_location(endpoint: Callable[..., Any]) -> str:
+    endpoint_name = getattr(endpoint, "__name__", "<unnamed_endpoint>")
+    location = endpoint_name
+    file_name = getattr(endpoint, "__globals__", {}).get("__file__")
+    if file_name:
+        location += f" at {file_name}"
+        code = getattr(endpoint, "__code__", None)
+        if code is not None:
+            location += f":{code.co_firstlineno}"
+    return location
+
+
 def get_openapi_operation_metadata(
     *, route: routing._APIRouteLike, method: str, operation_ids: set[str]
 ) -> dict[str, Any]:
@@ -385,20 +397,44 @@ def get_openapi_path(
                     operation["requestBody"] = request_body_oai
             if route.callbacks:
                 callbacks = {}
+                seen_callbacks: dict[str, routing.APIRoute] = {}
                 for callback in route.callbacks:
-                    if isinstance(callback, routing.APIRoute):
-                        (
-                            cb_path,
-                            cb_security_schemes,
-                            cb_definitions,
-                        ) = get_openapi_path(
-                            route=cast(routing._APIRouteLike, callback),
-                            operation_ids=operation_ids,
-                            model_name_map=model_name_map,
-                            field_mapping=field_mapping,
-                            separate_input_output_schemas=separate_input_output_schemas,
+                    if not isinstance(callback, routing.APIRoute):
+                        continue
+                    existing_callback = seen_callbacks.get(callback.name)
+                    if existing_callback is callback:
+                        # The same callback route was registered more than once
+                        # (e.g. at the router and at the path operation level),
+                        # it defines a single callback, process it only once
+                        continue
+                    if existing_callback is not None:
+                        raise FastAPIError(
+                            f"Duplicate OpenAPI callback key {callback.name!r} in "
+                            f"path operation {method} {route.path_format}, defined "
+                            "by both "
+                            f"{_get_endpoint_location(existing_callback.endpoint)} "
+                            "and "
+                            f"{_get_endpoint_location(callback.endpoint)}. "
+                            "Callback keys must be unique within a path operation, "
+                            "give one of the callback routes a different name."
                         )
-                        callbacks[callback.name] = {callback.path: cb_path}
+                    seen_callbacks[callback.name] = callback
+                    (
+                        cb_path,
+                        cb_security_schemes,
+                        cb_definitions,
+                    ) = get_openapi_path(
+                        route=cast(routing._APIRouteLike, callback),
+                        operation_ids=operation_ids,
+                        model_name_map=model_name_map,
+                        field_mapping=field_mapping,
+                        separate_input_output_schemas=separate_input_output_schemas,
+                    )
+                    callbacks[callback.name] = {callback.path: cb_path}
+                    if cb_security_schemes:
+                        security_schemes.update(cb_security_schemes)
+                    if cb_definitions:
+                        definitions.update(cb_definitions)
                 operation["callbacks"] = callbacks
             if route.status_code is not None:
                 status_code = str(route.status_code)
