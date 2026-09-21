@@ -1158,7 +1158,7 @@ class FastAPI(Starlette):
             self.add_route(self.redoc_url, redoc_html, include_in_schema=False)
 
     async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
-        if self.root_path:
+        if self.root_path and not scope.get("root_path"):
             scope["root_path"] = self.root_path
         await super().__call__(scope, receive, send)
 

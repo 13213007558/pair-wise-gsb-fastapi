@@ -2742,21 +2742,11 @@ class APIRouter(routing.Router):
             await route.handle(scope, receive, send)
             return
 
-        route_path = get_route_path(scope)
-        if scope["type"] == "http" and self.redirect_slashes and route_path != "/":
-            redirect_scope = dict(scope)
-            if route_path.endswith("/"):
-                redirect_scope["path"] = redirect_scope["path"].rstrip("/")
-            else:
-                redirect_scope["path"] = redirect_scope["path"] + "/"
-
-            for route in self.routes:
-                match, _ = route.matches(redirect_scope)
-                if match != Match.NONE:
-                    redirect_url = URL(scope=redirect_scope)
-                    response = RedirectResponse(url=str(redirect_url))
-                    await response(scope, receive, send)
-                    return
+        if scope["type"] == "http" and self.redirect_slashes:
+            redirect_response = self.redirect_slashes_response(scope)
+            if redirect_response is not None:
+                await redirect_response(scope, receive, send)
+                return
 
         (
             low_priority_match,
@@ -2779,6 +2769,49 @@ class APIRouter(routing.Router):
             return
 
         await self.default(scope, receive, send)
+
+    def redirect_slashes_response(self, scope: Scope) -> Response | None:
+        route_path = get_route_path(scope)
+        if route_path == "/":
+            return None
+
+        redirect_scope = dict(scope)
+        root_path = scope.get("root_path", "")
+        raw_path = scope.get("raw_path")
+        if not isinstance(raw_path, bytes):
+            raw_path = scope["path"].encode()
+
+        prefix_path = scope["path"][: -len(route_path)]
+        if route_path.endswith("/"):
+            redirect_scope["path"] = prefix_path + route_path.rstrip("/")
+            raw_path = raw_path.rstrip(b"/")
+            if not raw_path:
+                raw_path = b"/"
+        else:
+            redirect_scope["path"] = prefix_path + route_path + "/"
+            raw_path = raw_path + b"/"
+
+        if not self._redirect_slashes_match(redirect_scope, self.routes):
+            return None
+
+        redirect_path = raw_path.decode("latin-1")
+        root_prefix = root_path.rstrip("/")
+        if root_prefix and not scope["path"].startswith(root_path):
+            redirect_path = root_prefix + redirect_path
+        redirect_url = URL(scope=scope).replace(path=redirect_path)
+        return RedirectResponse(url=redirect_url)
+
+    def _redirect_slashes_match(
+        self, scope: Scope, routes: Sequence[BaseRoute]
+    ) -> bool:
+        for route in routes:
+            if isinstance(route, _IncludedRouter):
+                match, _, _, _ = route._match(scope)
+            else:
+                match, _ = route.matches(scope)
+            if match != Match.NONE:
+                return True
+        return False
 
     async def handle(self, scope: Scope, receive: Receive, send: Send) -> None:
         included_router = _get_scope_included_router(scope)
