@@ -48,6 +48,7 @@ from fastapi._compat import (
     Undefined,
     lenient_issubclass,
 )
+from fastapi.background import merge_background_tasks
 from fastapi.datastructures import Default, DefaultPlaceholder
 from fastapi.dependencies.models import (
     Dependant,
@@ -184,6 +185,13 @@ def websocket_session(
         await wrap_app_handling_exceptions(app, session)(scope, receive, send)
 
     return app
+
+
+def _dependant_uses_background_tasks(dependant: Dependant) -> bool:
+    return dependant.background_tasks_param_name is not None or any(
+        _dependant_uses_background_tasks(sub_dependant)
+        for sub_dependant in dependant.dependencies
+    )
 
 
 _T = TypeVar("_T")
@@ -358,7 +366,7 @@ def _build_response_args(
     *, status_code: int | None, solved_result: Any
 ) -> dict[str, Any]:
     response_args: dict[str, Any] = {
-        "background": solved_result.background_tasks,
+        "background": solved_result.background_tasks or None,
     }
     # If status_code was set, use it, otherwise use the default from the
     # response class, in the case of redirect it's 307
@@ -709,8 +717,10 @@ def get_request_handler(
                     is_coroutine=is_coroutine,
                 )
                 if isinstance(raw_response, Response):
-                    if raw_response.background is None:
-                        raw_response.background = solved_result.background_tasks
+                    raw_response.background = merge_background_tasks(
+                        solved_result.background_tasks,
+                        raw_response.background,
+                    )
                     response = raw_response
                 else:
                     response_args = _build_response_args(
@@ -822,6 +832,11 @@ class APIWebSocketRoute(routing.WebSocketRoute):
             call=self.endpoint,
             dependencies=self.dependencies,
         )
+        if _dependant_uses_background_tasks(self.dependant):
+            raise FastAPIError(
+                "BackgroundTasks can only be used with HTTP path operations, "
+                "not with WebSocket endpoints."
+            )
         self.app = websocket_session(
             get_websocket_app(
                 dependant=self.dependant,
@@ -2199,8 +2214,10 @@ class _FrontendRouteGroup(BaseRoute):
                 embed_body_fields=embed_body_fields,
             ) as solved_result:
                 response = await route.app.get_response_for_scope(scope)
-                if response.background is None:
-                    response.background = solved_result.background_tasks
+                response.background = merge_background_tasks(
+                    solved_result.background_tasks,
+                    response.background,
+                )
                 response.headers.raw.extend(solved_result.response.headers.raw)
                 await response(scope, receive, send)
             return

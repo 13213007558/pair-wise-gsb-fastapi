@@ -7,6 +7,10 @@ hide:
 
 ## Latest Changes
 
+### Fixes
+
+* 🐛 Merge dependency and response background tasks deterministically, run each task once, continue after task failures, report failures through callbacks and the ASGI path, and disallow `BackgroundTasks` for WebSocket endpoints.
+
 ### Refactors
 
 * 📱 Improve mobile responsiveness of conference rail. PR [#16196](https://github.com/fastapi/fastapi/pull/16196) by [@alejsdev](https://github.com/alejsdev).

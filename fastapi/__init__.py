@@ -6,6 +6,7 @@ from starlette import status as status
 
 from .applications import FastAPI as FastAPI
 from .background import BackgroundTasks as BackgroundTasks
+from .background import BackgroundTasksError as BackgroundTasksError
 from .datastructures import UploadFile as UploadFile
 from .exceptions import HTTPException as HTTPException
 from .exceptions import WebSocketException as WebSocketException

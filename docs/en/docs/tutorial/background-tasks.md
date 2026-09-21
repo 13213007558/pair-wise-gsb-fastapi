@@ -61,6 +61,31 @@ If there was a query in the request, it will be written to the log in a backgrou
 
 And then another background task generated at the *path operation function* will write a message using the `email` path parameter.
 
+## Execution order and failures { #execution-order-and-failures }
+
+FastAPI runs the tasks in one collection serially, in the order they were declared. Tasks from dependencies run before a task passed directly in a returned Starlette `Response(background=...)`.
+
+If a task raises an exception, FastAPI invokes that collection's `on_error` callback, records the failure, and still starts the remaining tasks. The original exception is raised after the response has been completed. Because the HTTP response status and body are already sent at that point, this exception is visible to the ASGI server and monitoring middleware, but cannot change the response into an HTTP 500.
+
+When only one task fails, that original exception is reraised. When multiple tasks or callbacks fail, FastAPI reraises `BackgroundTasksError`, whose `.errors` list contains every failure in execution order.
+
+```python
+def report_background_failure(task, error):
+    print(f"Background task failed: {error}")
+
+tasks = BackgroundTasks(on_error=report_background_failure)
+```
+
+Cancellation is handled separately. When the request is cancelled during application shutdown, an already started task still runs its `finally` block, while tasks that have not started are skipped. Regular synchronous (`def`) tasks are executed in a worker thread; Python cannot interrupt running blocking code, so cancellation is delivered after that function returns. `asyncio.CancelledError` is not reported as a normal task failure.
+
+Synchronous tasks receive a copy of the request execution context. Values stored in `contextvars.ContextVar` before the background starts are visible, but changes made inside a synchronous task do not propagate back to the request task.
+
+A client disconnecting after the response is complete is represented by subsequent `receive()` calls returning `http.disconnect`; it does not automatically cancel tasks that are already running. Tasks that need to stop when the connection is gone should wait for that ASGI message themselves.
+
+`BackgroundTasks` is only available for HTTP *path operations*. WebSocket endpoints cannot return an HTTP response background, so they must perform cleanup in their own `finally` blocks or lifespan handlers.
+
+Tasks in the same request collection are executed once. Returning the injected `BackgroundTasks` object as the `background` of a `Response` does not duplicate it.
+
 ## Technical Details { #technical-details }
 
 The class `BackgroundTasks` comes directly from [`starlette.background`](https://starlette.dev/background/).
