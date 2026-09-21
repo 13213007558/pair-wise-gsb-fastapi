@@ -74,6 +74,11 @@ from fastapi.exceptions import (
     ResponseValidationError,
     WebSocketRequestValidationError,
 )
+from fastapi.serialization import (
+    ResponseSerializer,
+    SerializerContext,
+    resolve_serializer_context,
+)
 from fastapi.sse import (
     _PING_INTERVAL,
     KEEPALIVE_COMMENT,
@@ -311,6 +316,7 @@ async def serialize_response(
     is_coroutine: bool = True,
     endpoint_ctx: EndpointContext | None = None,
     dump_json: bool = False,
+    serializer_context: SerializerContext | None = None,
 ) -> Any:
     if field:
         if is_coroutine:
@@ -326,6 +332,28 @@ async def serialize_response(
                 body=response_content,
                 endpoint_ctx=ctx,
             )
+        if serializer_context is not None:
+            # Explicit serializer context: validation above already
+            # preserved the original ValidationError locations/context.
+            # Dump in Python mode so values like Decimal or UUID survive
+            # as objects and the context encoders can be applied by
+            # jsonable_encoder. Unserializable objects raise instead of
+            # being silently stringified. The dump_json fast path is not
+            # used here as Pydantic's Rust serializer cannot apply the
+            # context encoders.
+            value = field.serialize(
+                value,
+                mode="python",
+                include=include,
+                exclude=exclude,
+                by_alias=by_alias,
+                exclude_unset=exclude_unset,
+                exclude_defaults=exclude_defaults,
+                exclude_none=exclude_none,
+            )
+            return jsonable_encoder(
+                value, custom_encoder=dict(serializer_context.encoders)
+            )
         serializer = field.serialize_json if dump_json else field.serialize
         return serializer(
             value,
@@ -338,6 +366,11 @@ async def serialize_response(
         )
 
     else:
+        if serializer_context is not None:
+            return jsonable_encoder(
+                response_content,
+                custom_encoder=dict(serializer_context.encoders),
+            )
         return jsonable_encoder(response_content)
 
 
@@ -389,6 +422,7 @@ def get_request_handler(
     strict_content_type: bool | DefaultPlaceholder = Default(True),
     stream_item_field: ModelField | None = None,
     is_json_stream: bool = False,
+    response_serializer: ResponseSerializer | None = None,
 ) -> Callable[[Request], Coroutine[Any, Any, Response]]:
     assert dependant.call is not None, "dependant.call must be a function"
     is_coroutine = _is_coroutine_callable(dependant.call)
@@ -716,13 +750,25 @@ def get_request_handler(
                     response_args = _build_response_args(
                         status_code=status_code, solved_result=solved_result
                     )
+                    # Resolve the serializer context for this request only.
+                    # It is passed explicitly down the serialization path
+                    # and never stored in shared state, so concurrent
+                    # requests, async endpoints and background tasks stay
+                    # isolated.
+                    serializer_context = await resolve_serializer_context(
+                        response_serializer, request
+                    )
                     # Use the fast path (dump_json) when no custom response
                     # class was set and a response field with a TypeAdapter
                     # exists. Serializes directly to JSON bytes via Pydantic's
                     # Rust core, skipping the intermediate Python dict +
-                    # json.dumps() step.
-                    use_dump_json = response_field is not None and isinstance(
-                        response_class, DefaultPlaceholder
+                    # json.dumps() step. A serializer context opts out of
+                    # the fast path: the Rust serializer cannot apply the
+                    # context encoders.
+                    use_dump_json = (
+                        response_field is not None
+                        and isinstance(response_class, DefaultPlaceholder)
+                        and serializer_context is None
                     )
                     content = await serialize_response(
                         field=response_field,
@@ -736,6 +782,7 @@ def get_request_handler(
                         is_coroutine=is_coroutine,
                         endpoint_ctx=endpoint_ctx,
                         dump_json=use_dump_json,
+                        serializer_context=serializer_context,
                     )
                     if use_dump_json:
                         response = Response(
@@ -930,6 +977,7 @@ class _APIRouteLike(Protocol):
     response_model_exclude_unset: bool
     response_model_exclude_defaults: bool
     response_model_exclude_none: bool
+    response_serializer: ResponseSerializer | None
     include_in_schema: bool
     response_class: type[Response] | DefaultPlaceholder
     dependency_overrides_provider: Any | None
@@ -984,6 +1032,7 @@ def _populate_api_route_state(
     include_in_schema: bool = True,
     response_class: type[Response] | DefaultPlaceholder = Default(JSONResponse),
     dependency_overrides_provider: Any | None = None,
+    response_serializer: ResponseSerializer | None = None,
     callbacks: list[BaseRoute] | None = None,
     openapi_extra: dict[str, Any] | None = None,
     generate_unique_id_function: Callable[[Any], str] | DefaultPlaceholder = Default(
@@ -1006,6 +1055,7 @@ def _populate_api_route_state(
     route.response_model_exclude_defaults = response_model_exclude_defaults
     route.response_model_exclude_none = response_model_exclude_none
     route.include_in_schema = include_in_schema
+    route.response_serializer = response_serializer
     route.response_class = response_class
     route.dependency_overrides_provider = dependency_overrides_provider
     route.callbacks = callbacks
@@ -1136,6 +1186,7 @@ class APIRoute(routing.Route):
     response_model_exclude_unset: bool
     response_model_exclude_defaults: bool
     response_model_exclude_none: bool
+    response_serializer: ResponseSerializer | None
     include_in_schema: bool
     response_class: type[Response] | DefaultPlaceholder
     dependency_overrides_provider: Any | None
@@ -1181,6 +1232,7 @@ class APIRoute(routing.Route):
         response_model_exclude_unset: bool = False,
         response_model_exclude_defaults: bool = False,
         response_model_exclude_none: bool = False,
+        response_serializer: ResponseSerializer | None = None,
         include_in_schema: bool = True,
         response_class: type[Response] | DefaultPlaceholder = Default(JSONResponse),
         dependency_overrides_provider: Any | None = None,
@@ -1211,8 +1263,9 @@ class APIRoute(routing.Route):
             response_model_by_alias=response_model_by_alias,
             response_model_exclude_unset=response_model_exclude_unset,
             response_model_exclude_defaults=response_model_exclude_defaults,
-            response_model_exclude_none=response_model_exclude_none,
-            include_in_schema=include_in_schema,
+               response_model_exclude_none=response_model_exclude_none,
+                include_in_schema=include_in_schema,
+                response_serializer=response_serializer,
             response_class=response_class,
             dependency_overrides_provider=dependency_overrides_provider,
             callbacks=callbacks,
@@ -1241,6 +1294,7 @@ class APIRoute(routing.Route):
             response_model_exclude_unset=route.response_model_exclude_unset,
             response_model_exclude_defaults=route.response_model_exclude_defaults,
             response_model_exclude_none=route.response_model_exclude_none,
+            response_serializer=route.response_serializer,
             dependency_overrides_provider=route.dependency_overrides_provider,
             embed_body_fields=route._embed_body_fields,
             strict_content_type=route.strict_content_type,
@@ -1389,6 +1443,7 @@ class _EffectiveRouteContext:
     response_model_exclude_unset: bool = False
     response_model_exclude_defaults: bool = False
     response_model_exclude_none: bool = False
+    response_serializer: ResponseSerializer | None = None
     include_in_schema: bool = True
     response_class: type[Response] | DefaultPlaceholder = field(
         default_factory=lambda: Default(JSONResponse)
@@ -1452,6 +1507,7 @@ class _EffectiveRouteContext:
             response_model_exclude_unset=route.response_model_exclude_unset,
             response_model_exclude_defaults=route.response_model_exclude_defaults,
             response_model_exclude_none=route.response_model_exclude_none,
+            response_serializer=route.response_serializer,
             include_in_schema=route.include_in_schema
             and include_context.include_in_schema,
             response_class=get_value_or_default(
@@ -2412,6 +2468,21 @@ class APIRouter(routing.Router):
                 """
             ),
         ] = APIRoute,
+        response_serializer: Annotated[
+            ResponseSerializer | None,
+            Doc(
+                """
+                An explicit serializer context (a SerializerContext or a
+                callable resolving one from the incoming Request) used to
+                encode this *path operation's* response.
+
+                The context applies only to the current response and does
+                not affect response_model_include / response_model_exclude,
+                response_model_by_alias, the OpenAPI schema, or responses
+                returned directly (including StreamingResponse).
+                """
+            ),
+        ] = None,
         on_startup: Annotated[
             Sequence[Callable[[], Any]] | None,
             Doc(
@@ -2561,6 +2632,7 @@ class APIRouter(routing.Router):
         self.dependency_overrides_provider = dependency_overrides_provider
         self.route_class = route_class
         self.default_response_class = default_response_class
+        self.response_serializer = response_serializer
         self.generate_unique_id_function = generate_unique_id_function
         self.strict_content_type = strict_content_type
         self._routes_version = 0
@@ -2908,6 +2980,7 @@ class APIRouter(routing.Router):
         response_model_exclude_unset: bool = False,
         response_model_exclude_defaults: bool = False,
         response_model_exclude_none: bool = False,
+        response_serializer: ResponseSerializer | None = None,
         include_in_schema: bool = True,
         response_class: type[Response] | DefaultPlaceholder = Default(JSONResponse),
         name: str | None = None,
@@ -2936,6 +3009,8 @@ class APIRouter(routing.Router):
         current_generate_unique_id = get_value_or_default(
             generate_unique_id_function, self.generate_unique_id_function
         )
+        if response_serializer is None:
+            response_serializer = self.response_serializer
         route = route_class(
             self.prefix + path,
             endpoint=endpoint,
@@ -2956,6 +3031,7 @@ class APIRouter(routing.Router):
             response_model_exclude_unset=response_model_exclude_unset,
             response_model_exclude_defaults=response_model_exclude_defaults,
             response_model_exclude_none=response_model_exclude_none,
+            response_serializer=response_serializer,
             include_in_schema=include_in_schema and self.include_in_schema,
             response_class=current_response_class,
             name=name,
@@ -2991,6 +3067,7 @@ class APIRouter(routing.Router):
         response_model_exclude_unset: bool = False,
         response_model_exclude_defaults: bool = False,
         response_model_exclude_none: bool = False,
+        response_serializer: ResponseSerializer | None = None,
         include_in_schema: bool = True,
         response_class: type[Response] = Default(JSONResponse),
         name: str | None = None,
@@ -3021,6 +3098,7 @@ class APIRouter(routing.Router):
                 response_model_exclude_unset=response_model_exclude_unset,
                 response_model_exclude_defaults=response_model_exclude_defaults,
                 response_model_exclude_none=response_model_exclude_none,
+                response_serializer=response_serializer,
                 include_in_schema=include_in_schema,
                 response_class=response_class,
                 name=name,
@@ -3573,6 +3651,21 @@ class APIRouter(routing.Router):
                 """
             ),
         ] = False,
+        response_serializer: Annotated[
+            ResponseSerializer | None,
+            Doc(
+                """
+                An explicit serializer context (a SerializerContext or a
+                callable resolving one from the incoming Request) used to
+                encode this *path operation's* response.
+
+                The context applies only to the current response and does
+                not affect response_model_include / response_model_exclude,
+                response_model_by_alias, the OpenAPI schema, or responses
+                returned directly (including StreamingResponse).
+                """
+            ),
+        ] = None,
         include_in_schema: Annotated[
             bool,
             Doc(
@@ -3688,6 +3781,7 @@ class APIRouter(routing.Router):
             response_model_exclude_unset=response_model_exclude_unset,
             response_model_exclude_defaults=response_model_exclude_defaults,
             response_model_exclude_none=response_model_exclude_none,
+            response_serializer=response_serializer,
             include_in_schema=include_in_schema,
             response_class=response_class,
             name=name,
@@ -3950,6 +4044,21 @@ class APIRouter(routing.Router):
                 """
             ),
         ] = False,
+        response_serializer: Annotated[
+            ResponseSerializer | None,
+            Doc(
+                """
+                An explicit serializer context (a SerializerContext or a
+                callable resolving one from the incoming Request) used to
+                encode this *path operation's* response.
+
+                The context applies only to the current response and does
+                not affect response_model_include / response_model_exclude,
+                response_model_by_alias, the OpenAPI schema, or responses
+                returned directly (including StreamingResponse).
+                """
+            ),
+        ] = None,
         include_in_schema: Annotated[
             bool,
             Doc(
@@ -4070,6 +4179,7 @@ class APIRouter(routing.Router):
             response_model_exclude_unset=response_model_exclude_unset,
             response_model_exclude_defaults=response_model_exclude_defaults,
             response_model_exclude_none=response_model_exclude_none,
+            response_serializer=response_serializer,
             include_in_schema=include_in_schema,
             response_class=response_class,
             name=name,
@@ -4332,6 +4442,21 @@ class APIRouter(routing.Router):
                 """
             ),
         ] = False,
+        response_serializer: Annotated[
+            ResponseSerializer | None,
+            Doc(
+                """
+                An explicit serializer context (a SerializerContext or a
+                callable resolving one from the incoming Request) used to
+                encode this *path operation's* response.
+
+                The context applies only to the current response and does
+                not affect response_model_include / response_model_exclude,
+                response_model_by_alias, the OpenAPI schema, or responses
+                returned directly (including StreamingResponse).
+                """
+            ),
+        ] = None,
         include_in_schema: Annotated[
             bool,
             Doc(
@@ -4452,6 +4577,7 @@ class APIRouter(routing.Router):
             response_model_exclude_unset=response_model_exclude_unset,
             response_model_exclude_defaults=response_model_exclude_defaults,
             response_model_exclude_none=response_model_exclude_none,
+            response_serializer=response_serializer,
             include_in_schema=include_in_schema,
             response_class=response_class,
             name=name,
@@ -4714,6 +4840,21 @@ class APIRouter(routing.Router):
                 """
             ),
         ] = False,
+        response_serializer: Annotated[
+            ResponseSerializer | None,
+            Doc(
+                """
+                An explicit serializer context (a SerializerContext or a
+                callable resolving one from the incoming Request) used to
+                encode this *path operation's* response.
+
+                The context applies only to the current response and does
+                not affect response_model_include / response_model_exclude,
+                response_model_by_alias, the OpenAPI schema, or responses
+                returned directly (including StreamingResponse).
+                """
+            ),
+        ] = None,
         include_in_schema: Annotated[
             bool,
             Doc(
@@ -4829,6 +4970,7 @@ class APIRouter(routing.Router):
             response_model_exclude_unset=response_model_exclude_unset,
             response_model_exclude_defaults=response_model_exclude_defaults,
             response_model_exclude_none=response_model_exclude_none,
+            response_serializer=response_serializer,
             include_in_schema=include_in_schema,
             response_class=response_class,
             name=name,
@@ -5091,6 +5233,21 @@ class APIRouter(routing.Router):
                 """
             ),
         ] = False,
+        response_serializer: Annotated[
+            ResponseSerializer | None,
+            Doc(
+                """
+                An explicit serializer context (a SerializerContext or a
+                callable resolving one from the incoming Request) used to
+                encode this *path operation's* response.
+
+                The context applies only to the current response and does
+                not affect response_model_include / response_model_exclude,
+                response_model_by_alias, the OpenAPI schema, or responses
+                returned directly (including StreamingResponse).
+                """
+            ),
+        ] = None,
         include_in_schema: Annotated[
             bool,
             Doc(
@@ -5206,6 +5363,7 @@ class APIRouter(routing.Router):
             response_model_exclude_unset=response_model_exclude_unset,
             response_model_exclude_defaults=response_model_exclude_defaults,
             response_model_exclude_none=response_model_exclude_none,
+            response_serializer=response_serializer,
             include_in_schema=include_in_schema,
             response_class=response_class,
             name=name,
@@ -5468,6 +5626,21 @@ class APIRouter(routing.Router):
                 """
             ),
         ] = False,
+        response_serializer: Annotated[
+            ResponseSerializer | None,
+            Doc(
+                """
+                An explicit serializer context (a SerializerContext or a
+                callable resolving one from the incoming Request) used to
+                encode this *path operation's* response.
+
+                The context applies only to the current response and does
+                not affect response_model_include / response_model_exclude,
+                response_model_by_alias, the OpenAPI schema, or responses
+                returned directly (including StreamingResponse).
+                """
+            ),
+        ] = None,
         include_in_schema: Annotated[
             bool,
             Doc(
@@ -5588,6 +5761,7 @@ class APIRouter(routing.Router):
             response_model_exclude_unset=response_model_exclude_unset,
             response_model_exclude_defaults=response_model_exclude_defaults,
             response_model_exclude_none=response_model_exclude_none,
+            response_serializer=response_serializer,
             include_in_schema=include_in_schema,
             response_class=response_class,
             name=name,
@@ -5850,6 +6024,21 @@ class APIRouter(routing.Router):
                 """
             ),
         ] = False,
+        response_serializer: Annotated[
+            ResponseSerializer | None,
+            Doc(
+                """
+                An explicit serializer context (a SerializerContext or a
+                callable resolving one from the incoming Request) used to
+                encode this *path operation's* response.
+
+                The context applies only to the current response and does
+                not affect response_model_include / response_model_exclude,
+                response_model_by_alias, the OpenAPI schema, or responses
+                returned directly (including StreamingResponse).
+                """
+            ),
+        ] = None,
         include_in_schema: Annotated[
             bool,
             Doc(
@@ -5970,6 +6159,7 @@ class APIRouter(routing.Router):
             response_model_exclude_unset=response_model_exclude_unset,
             response_model_exclude_defaults=response_model_exclude_defaults,
             response_model_exclude_none=response_model_exclude_none,
+            response_serializer=response_serializer,
             include_in_schema=include_in_schema,
             response_class=response_class,
             name=name,
@@ -6232,6 +6422,21 @@ class APIRouter(routing.Router):
                 """
             ),
         ] = False,
+        response_serializer: Annotated[
+            ResponseSerializer | None,
+            Doc(
+                """
+                An explicit serializer context (a SerializerContext or a
+                callable resolving one from the incoming Request) used to
+                encode this *path operation's* response.
+
+                The context applies only to the current response and does
+                not affect response_model_include / response_model_exclude,
+                response_model_by_alias, the OpenAPI schema, or responses
+                returned directly (including StreamingResponse).
+                """
+            ),
+        ] = None,
         include_in_schema: Annotated[
             bool,
             Doc(
@@ -6352,6 +6557,7 @@ class APIRouter(routing.Router):
             response_model_exclude_unset=response_model_exclude_unset,
             response_model_exclude_defaults=response_model_exclude_defaults,
             response_model_exclude_none=response_model_exclude_none,
+            response_serializer=response_serializer,
             include_in_schema=include_in_schema,
             response_class=response_class,
             name=name,

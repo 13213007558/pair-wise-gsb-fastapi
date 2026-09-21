@@ -21,6 +21,7 @@ from fastapi.openapi.docs import (
 )
 from fastapi.openapi.utils import get_openapi
 from fastapi.params import Depends
+from fastapi.serialization import ResponseSerializer
 from fastapi.types import DecoratedCallable, IncEx
 from fastapi.utils import generate_unique_id
 from starlette.applications import Starlette
@@ -1184,6 +1185,7 @@ class FastAPI(Starlette):
         response_model_exclude_unset: bool = False,
         response_model_exclude_defaults: bool = False,
         response_model_exclude_none: bool = False,
+        response_serializer: ResponseSerializer | None = None,
         include_in_schema: bool = True,
         response_class: type[Response] | DefaultPlaceholder = Default(JSONResponse),
         name: str | None = None,
@@ -1212,6 +1214,7 @@ class FastAPI(Starlette):
             response_model_exclude_unset=response_model_exclude_unset,
             response_model_exclude_defaults=response_model_exclude_defaults,
             response_model_exclude_none=response_model_exclude_none,
+            response_serializer=response_serializer,
             include_in_schema=include_in_schema,
             response_class=response_class,
             name=name,
@@ -1319,6 +1322,7 @@ class FastAPI(Starlette):
         response_model_exclude_unset: bool = False,
         response_model_exclude_defaults: bool = False,
         response_model_exclude_none: bool = False,
+        response_serializer: ResponseSerializer | None = None,
         include_in_schema: bool = True,
         response_class: type[Response] = Default(JSONResponse),
         name: str | None = None,
@@ -1348,6 +1352,7 @@ class FastAPI(Starlette):
                 response_model_exclude_unset=response_model_exclude_unset,
                 response_model_exclude_defaults=response_model_exclude_defaults,
                 response_model_exclude_none=response_model_exclude_none,
+                response_serializer=response_serializer,
                 include_in_schema=include_in_schema,
                 response_class=response_class,
                 name=name,
@@ -1897,6 +1902,21 @@ class FastAPI(Starlette):
                 """
             ),
         ] = False,
+        response_serializer: Annotated[
+            ResponseSerializer | None,
+            Doc(
+                """
+                An explicit serializer context (a SerializerContext or a
+                callable resolving one from the incoming Request) used to
+                encode this *path operation's* response.
+
+                The context applies only to the current response and does
+                not affect response_model_include / response_model_exclude,
+                response_model_by_alias, the OpenAPI schema, or responses
+                returned directly (including StreamingResponse).
+                """
+            ),
+        ] = None,
         include_in_schema: Annotated[
             bool,
             Doc(
@@ -2008,6 +2028,7 @@ class FastAPI(Starlette):
             response_model_exclude_unset=response_model_exclude_unset,
             response_model_exclude_defaults=response_model_exclude_defaults,
             response_model_exclude_none=response_model_exclude_none,
+            response_serializer=response_serializer,
             include_in_schema=include_in_schema,
             response_class=response_class,
             name=name,
@@ -2270,6 +2291,21 @@ class FastAPI(Starlette):
                 """
             ),
         ] = False,
+        response_serializer: Annotated[
+            ResponseSerializer | None,
+            Doc(
+                """
+                An explicit serializer context (a SerializerContext or a
+                callable resolving one from the incoming Request) used to
+                encode this *path operation's* response.
+
+                The context applies only to the current response and does
+                not affect response_model_include / response_model_exclude,
+                response_model_by_alias, the OpenAPI schema, or responses
+                returned directly (including StreamingResponse).
+                """
+            ),
+        ] = None,
         include_in_schema: Annotated[
             bool,
             Doc(
@@ -2386,6 +2422,7 @@ class FastAPI(Starlette):
             response_model_exclude_unset=response_model_exclude_unset,
             response_model_exclude_defaults=response_model_exclude_defaults,
             response_model_exclude_none=response_model_exclude_none,
+            response_serializer=response_serializer,
             include_in_schema=include_in_schema,
             response_class=response_class,
             name=name,
@@ -2648,6 +2685,21 @@ class FastAPI(Starlette):
                 """
             ),
         ] = False,
+        response_serializer: Annotated[
+            ResponseSerializer | None,
+            Doc(
+                """
+                An explicit serializer context (a SerializerContext or a
+                callable resolving one from the incoming Request) used to
+                encode this *path operation's* response.
+
+                The context applies only to the current response and does
+                not affect response_model_include / response_model_exclude,
+                response_model_by_alias, the OpenAPI schema, or responses
+                returned directly (including StreamingResponse).
+                """
+            ),
+        ] = None,
         include_in_schema: Annotated[
             bool,
             Doc(
@@ -2764,6 +2816,7 @@ class FastAPI(Starlette):
             response_model_exclude_unset=response_model_exclude_unset,
             response_model_exclude_defaults=response_model_exclude_defaults,
             response_model_exclude_none=response_model_exclude_none,
+            response_serializer=response_serializer,
             include_in_schema=include_in_schema,
             response_class=response_class,
             name=name,
@@ -3026,6 +3079,21 @@ class FastAPI(Starlette):
                 """
             ),
         ] = False,
+        response_serializer: Annotated[
+            ResponseSerializer | None,
+            Doc(
+                """
+                An explicit serializer context (a SerializerContext or a
+                callable resolving one from the incoming Request) used to
+                encode this *path operation's* response.
+
+                The context applies only to the current response and does
+                not affect response_model_include / response_model_exclude,
+                response_model_by_alias, the OpenAPI schema, or responses
+                returned directly (including StreamingResponse).
+                """
+            ),
+        ] = None,
         include_in_schema: Annotated[
             bool,
             Doc(
@@ -3137,6 +3205,7 @@ class FastAPI(Starlette):
             response_model_exclude_unset=response_model_exclude_unset,
             response_model_exclude_defaults=response_model_exclude_defaults,
             response_model_exclude_none=response_model_exclude_none,
+            response_serializer=response_serializer,
             include_in_schema=include_in_schema,
             response_class=response_class,
             name=name,
@@ -3399,6 +3468,21 @@ class FastAPI(Starlette):
                 """
             ),
         ] = False,
+        response_serializer: Annotated[
+            ResponseSerializer | None,
+            Doc(
+                """
+                An explicit serializer context (a SerializerContext or a
+                callable resolving one from the incoming Request) used to
+                encode this *path operation's* response.
+
+                The context applies only to the current response and does
+                not affect response_model_include / response_model_exclude,
+                response_model_by_alias, the OpenAPI schema, or responses
+                returned directly (including StreamingResponse).
+                """
+            ),
+        ] = None,
         include_in_schema: Annotated[
             bool,
             Doc(
@@ -3510,6 +3594,7 @@ class FastAPI(Starlette):
             response_model_exclude_unset=response_model_exclude_unset,
             response_model_exclude_defaults=response_model_exclude_defaults,
             response_model_exclude_none=response_model_exclude_none,
+            response_serializer=response_serializer,
             include_in_schema=include_in_schema,
             response_class=response_class,
             name=name,
@@ -3772,6 +3857,21 @@ class FastAPI(Starlette):
                 """
             ),
         ] = False,
+        response_serializer: Annotated[
+            ResponseSerializer | None,
+            Doc(
+                """
+                An explicit serializer context (a SerializerContext or a
+                callable resolving one from the incoming Request) used to
+                encode this *path operation's* response.
+
+                The context applies only to the current response and does
+                not affect response_model_include / response_model_exclude,
+                response_model_by_alias, the OpenAPI schema, or responses
+                returned directly (including StreamingResponse).
+                """
+            ),
+        ] = None,
         include_in_schema: Annotated[
             bool,
             Doc(
@@ -3883,6 +3983,7 @@ class FastAPI(Starlette):
             response_model_exclude_unset=response_model_exclude_unset,
             response_model_exclude_defaults=response_model_exclude_defaults,
             response_model_exclude_none=response_model_exclude_none,
+            response_serializer=response_serializer,
             include_in_schema=include_in_schema,
             response_class=response_class,
             name=name,
@@ -4145,6 +4246,21 @@ class FastAPI(Starlette):
                 """
             ),
         ] = False,
+        response_serializer: Annotated[
+            ResponseSerializer | None,
+            Doc(
+                """
+                An explicit serializer context (a SerializerContext or a
+                callable resolving one from the incoming Request) used to
+                encode this *path operation's* response.
+
+                The context applies only to the current response and does
+                not affect response_model_include / response_model_exclude,
+                response_model_by_alias, the OpenAPI schema, or responses
+                returned directly (including StreamingResponse).
+                """
+            ),
+        ] = None,
         include_in_schema: Annotated[
             bool,
             Doc(
@@ -4261,6 +4377,7 @@ class FastAPI(Starlette):
             response_model_exclude_unset=response_model_exclude_unset,
             response_model_exclude_defaults=response_model_exclude_defaults,
             response_model_exclude_none=response_model_exclude_none,
+            response_serializer=response_serializer,
             include_in_schema=include_in_schema,
             response_class=response_class,
             name=name,
@@ -4523,6 +4640,21 @@ class FastAPI(Starlette):
                 """
             ),
         ] = False,
+        response_serializer: Annotated[
+            ResponseSerializer | None,
+            Doc(
+                """
+                An explicit serializer context (a SerializerContext or a
+                callable resolving one from the incoming Request) used to
+                encode this *path operation's* response.
+
+                The context applies only to the current response and does
+                not affect response_model_include / response_model_exclude,
+                response_model_by_alias, the OpenAPI schema, or responses
+                returned directly (including StreamingResponse).
+                """
+            ),
+        ] = None,
         include_in_schema: Annotated[
             bool,
             Doc(
@@ -4634,6 +4766,7 @@ class FastAPI(Starlette):
             response_model_exclude_unset=response_model_exclude_unset,
             response_model_exclude_defaults=response_model_exclude_defaults,
             response_model_exclude_none=response_model_exclude_none,
+            response_serializer=response_serializer,
             include_in_schema=include_in_schema,
             response_class=response_class,
             name=name,

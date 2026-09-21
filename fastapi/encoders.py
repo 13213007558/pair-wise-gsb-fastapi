@@ -242,7 +242,11 @@ def jsonable_encoder(
         exclude = set(exclude)  # type: ignore[assignment]  # ty: ignore[invalid-assignment]
     if isinstance(obj, BaseModel):
         obj_dict = obj.model_dump(
-            mode="json",
+            # When custom encoders are provided, dump in Python mode so that
+            # values like Decimal or UUID survive as objects and can still be
+            # matched by the custom (and default) encoders below, including
+            # for models nested inside other models.
+            mode="python" if custom_encoder else "json",
             include=include,
             exclude=exclude,
             by_alias=by_alias,
@@ -254,6 +258,7 @@ def jsonable_encoder(
             obj_dict,
             exclude_none=exclude_none,
             exclude_defaults=exclude_defaults,
+            custom_encoder=custom_encoder,
             sqlalchemy_safe=sqlalchemy_safe,
         )
     if dataclasses.is_dataclass(obj):
