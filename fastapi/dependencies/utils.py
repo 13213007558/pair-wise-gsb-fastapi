@@ -66,6 +66,10 @@ from fastapi.dependencies.models import (
 )
 from fastapi.exceptions import DependencyScopeError
 from fastapi.logger import logger
+from fastapi.serializers import (
+    SERIALIZER_CONTEXT_SCOPE_KEY,
+    SerializerContext,
+)
 from fastapi.security.oauth2 import SecurityScopes
 from fastapi.types import DependencyCacheKey
 from fastapi.utils import create_model_field, get_path_param_names
@@ -368,6 +372,9 @@ def add_non_field_param_to_dependency(
     elif lenient_issubclass(type_annotation, SecurityScopes):
         dependant.security_scopes_param_name = param_name
         return True
+    elif lenient_issubclass(type_annotation, SerializerContext):
+        dependant.serializer_context_param_name = param_name
+        return True
     return None
 
 
@@ -482,6 +489,7 @@ def analyze_param(
             Response,
             StarletteBackgroundTasks,
             SecurityScopes,
+            SerializerContext,
         ),
     ):
         assert field_info is None, (
@@ -674,6 +682,8 @@ async def solve_dependencies(
             solved = await call(**solved_result.values)
         else:
             solved = await run_in_threadpool(call, **solved_result.values)
+        if isinstance(solved, SerializerContext):
+            request.scope[SERIALIZER_CONTEXT_SCOPE_KEY] = solved
         if sub_dependant.name is not None:
             values[sub_dependant.name] = solved
         if sub_dependant_cache_key not in dependency_cache:
@@ -722,6 +732,12 @@ async def solve_dependencies(
         values[dependant.security_scopes_param_name] = SecurityScopes(
             scopes=_get_oauth_scopes(dependant=dependant)
         )
+    if dependant.serializer_context_param_name:
+        serializer_context = request.scope.get(SERIALIZER_CONTEXT_SCOPE_KEY)
+        if not isinstance(serializer_context, SerializerContext):
+            serializer_context = SerializerContext()
+            request.scope[SERIALIZER_CONTEXT_SCOPE_KEY] = serializer_context
+        values[dependant.serializer_context_param_name] = serializer_context
     return SolvedDependency(
         values=values,
         errors=errors,

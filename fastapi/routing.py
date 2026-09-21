@@ -74,6 +74,11 @@ from fastapi.exceptions import (
     ResponseValidationError,
     WebSocketRequestValidationError,
 )
+from fastapi.serializers import (
+    SERIALIZER_CONTEXT_SCOPE_KEY,
+    SerializerContext,
+    encode_with_scoped_encoders,
+)
 from fastapi.sse import (
     _PING_INTERVAL,
     KEEPALIVE_COMMENT,
@@ -311,7 +316,12 @@ async def serialize_response(
     is_coroutine: bool = True,
     endpoint_ctx: EndpointContext | None = None,
     dump_json: bool = False,
+    serializer_context: SerializerContext | None = None,
 ) -> Any:
+    context = dict(serializer_context.context) if serializer_context else None
+    custom_encoders = (
+        dict(serializer_context.custom_encoders) if serializer_context else {}
+    )
     if field:
         if is_coroutine:
             value, errors = field.validate(response_content, {}, loc=("response",))
@@ -326,6 +336,19 @@ async def serialize_response(
                 body=response_content,
                 endpoint_ctx=ctx,
             )
+        if custom_encoders:
+            content = field.serialize(
+                value,
+                mode="python",
+                include=include,
+                exclude=exclude,
+                by_alias=by_alias,
+                exclude_unset=exclude_unset,
+                exclude_defaults=exclude_defaults,
+                exclude_none=exclude_none,
+                context=context,
+            )
+            return encode_with_scoped_encoders(content, custom_encoders)
         serializer = field.serialize_json if dump_json else field.serialize
         return serializer(
             value,
@@ -335,9 +358,14 @@ async def serialize_response(
             exclude_unset=exclude_unset,
             exclude_defaults=exclude_defaults,
             exclude_none=exclude_none,
+            context=context,
         )
 
     else:
+        if custom_encoders:
+            return encode_with_scoped_encoders(
+                response_content, custom_encoders
+            )
         return jsonable_encoder(response_content)
 
 
@@ -713,6 +741,11 @@ def get_request_handler(
                         raw_response.background = solved_result.background_tasks
                     response = raw_response
                 else:
+                    serializer_context = request.scope.get(
+                        SERIALIZER_CONTEXT_SCOPE_KEY
+                    )
+                    if not isinstance(serializer_context, SerializerContext):
+                        serializer_context = None
                     response_args = _build_response_args(
                         status_code=status_code, solved_result=solved_result
                     )
@@ -721,8 +754,13 @@ def get_request_handler(
                     # exists. Serializes directly to JSON bytes via Pydantic's
                     # Rust core, skipping the intermediate Python dict +
                     # json.dumps() step.
-                    use_dump_json = response_field is not None and isinstance(
-                        response_class, DefaultPlaceholder
+                    use_dump_json = (
+                        response_field is not None
+                        and isinstance(response_class, DefaultPlaceholder)
+                        and not (
+                            serializer_context
+                            and serializer_context.custom_encoders
+                        )
                     )
                     content = await serialize_response(
                         field=response_field,
@@ -736,6 +774,7 @@ def get_request_handler(
                         is_coroutine=is_coroutine,
                         endpoint_ctx=endpoint_ctx,
                         dump_json=use_dump_json,
+                        serializer_context=serializer_context,
                     )
                     if use_dump_json:
                         response = Response(

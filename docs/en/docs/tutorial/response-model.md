@@ -337,6 +337,26 @@ If you forget to use a `set` and use a `list` or `tuple` instead, FastAPI will s
 
 {* ../../docs_src/response_model/tutorial006_py310.py hl[29,35] *}
 
+### Request-scoped serializer context and encoders { #request-scoped-serializer-context-and-encoders }
+
+If different tenants need different field names or different encodings for
+types such as `Decimal` and `UUID`, inject a `SerializerContext`. FastAPI
+creates a separate object for each request and passes its `context` to Pydantic
+serializers. Values in `custom_encoders` receive the Python values after
+response validation and before JSON encoding.
+
+{* ../../docs_src/response_model/tutorial007_py310.py hl[10:17,21:30,33] *}
+
+The context propagates through nested models, lists, union branches,
+dataclasses, and ORM objects validated by the response model, while `None`
+values are left untouched. It does not change the OpenAPI schema and it does
+not override `response_model_include`, `response_model_exclude`, or
+`response_model_by_alias`.
+
+Returning a custom `Response` or a `StreamingResponse` intentionally bypasses
+response-model serialization. For those responses, use the injected context
+explicitly, for example by calling `serializer.encode(content)`.
+
 ## Recap { #recap }
 
 Use the *path operation decorator's* parameter `response_model` to define response models and especially to ensure private data is filtered out.

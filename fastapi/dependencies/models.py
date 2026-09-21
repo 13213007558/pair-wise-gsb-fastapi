@@ -44,6 +44,7 @@ class Dependant:
     response_param_name: str | None = None
     background_tasks_param_name: str | None = None
     security_scopes_param_name: str | None = None
+    serializer_context_param_name: str | None = None
     own_oauth_scopes: list[str] | None = None
     parent_oauth_scopes: list[str] | None = None
     use_cache: bool = True
