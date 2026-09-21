@@ -61,9 +61,40 @@ If there was a query in the request, it will be written to the log in a backgrou
 
 And then another background task generated at the *path operation function* will write a message using the `email` path parameter.
 
+## Execution semantics { #execution-semantics }
+
+When several background tasks are registered for the same response (for example from a dependency and from the *path operation function*), **FastAPI** runs them with a well-defined behavior:
+
+### Order and single execution { #execution-order }
+
+* Tasks run **sequentially** (one at a time, not concurrently), in the order they were added: dependencies first (in declaration order at the same dependency level), then the *path operation function*.
+* If the *path operation* returns a `Response` that already has its own `background`, the two are **merged** instead of one silently replacing the other: the tasks from the injected `BackgroundTasks` run first, then the response's own background task(s).
+* Each task runs **exactly once**. A `BackgroundTasks` object that already started running cannot be called again (calling it raises `RuntimeError` instead of re-running the tasks), and tasks cannot be added to it anymore.
+
+### Sync and async tasks { #sync-and-async-tasks }
+
+* `async def` task functions are awaited directly in the event loop.
+* Plain `def` task functions are run in a **thread pool** (so they don't block the event loop), with the current **contextvars** propagated into the worker thread.
+
+### Errors in background tasks { #background-task-errors }
+
+Background tasks run **after the response has been sent** to the client. This means that if a task fails, the response can no longer be changed into an HTTP error (e.g. a 500): the client already received the successful response. Instead:
+
+* The failure is **recorded** per task, the **remaining tasks still run** (tasks that already started always finish, including their `finally` blocks), and once all tasks have been attempted, a `fastapi.background.BackgroundTaskError` is raised. It carries the original exceptions in `.exceptions` and the per-task records in `.records`, so the error reaches the server logs / your monitoring system with the original failure reason instead of being silently swallowed.
+* You can observe exactly what happened through `BackgroundTasks.records`: each `BackgroundTaskRecord` has a `status` (`"pending"`, `"running"`, `"succeeded"`, `"failed"`, `"cancelled"`) and the `exception` if the task failed.
+* You can also pass an `on_error` callback (sync or async) when creating `BackgroundTasks`; it is called with the failed `BackgroundTaskRecord` for each failing task, which is a convenient hook for metrics and monitoring.
+
+### Cancellation, disconnects and shutdown { #background-task-cancellation }
+
+Cancellation is **not** treated as a task failure. If the client disconnects or the application is shutting down and the running task is cancelled, `asyncio.CancelledError` propagates immediately: the tasks that didn't run yet stay `"pending"` and are skipped, and the cancellation is not converted into a `BackgroundTaskError`.
+
+### WebSockets { #background-tasks-websockets }
+
+`BackgroundTasks` is tied to the HTTP request/response cycle: the tasks run after the **response** is sent. In **WebSocket** endpoints there is no response to send, so background tasks declared there are **not executed**. Do any follow-up work in the WebSocket endpoint itself, after the WebSocket is closed.
+
 ## Technical Details { #technical-details }
 
-The class `BackgroundTasks` comes directly from [`starlette.background`](https://starlette.dev/background/).
+The class `fastapi.BackgroundTasks` extends [`starlette.background.BackgroundTasks`](https://starlette.dev/background/) with the execution semantics described above (ordered single execution, per-task records, failure aggregation and cancellation handling).
 
 It is imported/included directly into FastAPI so that you can import it from `fastapi` and avoid accidentally importing the alternative `BackgroundTask` (without the `s` at the end) from `starlette.background`.
 

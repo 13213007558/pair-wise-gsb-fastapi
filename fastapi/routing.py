@@ -48,6 +48,7 @@ from fastapi._compat import (
     Undefined,
     lenient_issubclass,
 )
+from fastapi.background import BackgroundTasks as FastAPIBackgroundTasks
 from fastapi.datastructures import Default, DefaultPlaceholder
 from fastapi.dependencies.models import (
     Dependant,
@@ -91,6 +92,8 @@ from fastapi.utils import (
 from starlette import routing
 from starlette._exception_handler import wrap_app_handling_exceptions
 from starlette._utils import get_route_path, is_async_callable
+from starlette.background import BackgroundTask as StarletteBackgroundTask
+from starlette.background import BackgroundTasks as StarletteBackgroundTasks
 from starlette.concurrency import iterate_in_threadpool, run_in_threadpool
 from starlette.datastructures import URL, FormData, URLPath
 from starlette.exceptions import HTTPException
@@ -370,6 +373,31 @@ def _build_response_args(
     if solved_result.response.status_code:
         response_args["status_code"] = solved_result.response.status_code
     return response_args
+
+
+def _merge_background(
+    response_background: StarletteBackgroundTask | None,
+    dependency_background: StarletteBackgroundTasks | None,
+) -> StarletteBackgroundTask | None:
+    # Merge the background tasks collected through dependency injection with
+    # a background already attached to the Response returned by the endpoint,
+    # so no task is silently dropped. The dependency-injected tasks (added by
+    # dependencies first, then by the endpoint, in declaration order) run
+    # first, followed by the response's own background task(s).
+    if dependency_background is None or not dependency_background.tasks:
+        return response_background
+    if response_background is None:
+        return dependency_background
+    if isinstance(response_background, StarletteBackgroundTasks):
+        extra_tasks: list[StarletteBackgroundTask] = list(response_background.tasks)
+    else:
+        extra_tasks = [response_background]
+    if isinstance(dependency_background, FastAPIBackgroundTasks):
+        dependency_background.extend(extra_tasks)
+        return dependency_background
+    return FastAPIBackgroundTasks(
+        tasks=[*dependency_background.tasks, *extra_tasks]
+    )
 
 
 def get_request_handler(
@@ -709,8 +737,9 @@ def get_request_handler(
                     is_coroutine=is_coroutine,
                 )
                 if isinstance(raw_response, Response):
-                    if raw_response.background is None:
-                        raw_response.background = solved_result.background_tasks
+                    raw_response.background = _merge_background(
+                        raw_response.background, solved_result.background_tasks
+                    )
                     response = raw_response
                 else:
                     response_args = _build_response_args(
@@ -2199,8 +2228,9 @@ class _FrontendRouteGroup(BaseRoute):
                 embed_body_fields=embed_body_fields,
             ) as solved_result:
                 response = await route.app.get_response_for_scope(scope)
-                if response.background is None:
-                    response.background = solved_result.background_tasks
+                response.background = _merge_background(
+                    response.background, solved_result.background_tasks
+                )
                 response.headers.raw.extend(solved_result.response.headers.raw)
                 await response(scope, receive, send)
             return

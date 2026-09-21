@@ -228,7 +228,10 @@ addopts = [
 ]
 strict_xfail = true
 filterwarnings = [
-    "error",
+  "error",
+  # starlette 1.6.0's testclient still references the deprecated
+  # anyio.abc.BlockingPortal alias removed from anyio.abc in anyio 4.15
+  "ignore:The anyio.abc.BlockingPortal alias is deprecated:DeprecationWarning",
 ]
 timeout = "20"
 
