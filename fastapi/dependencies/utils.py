@@ -66,6 +66,11 @@ from fastapi.dependencies.models import (
 )
 from fastapi.exceptions import DependencyScopeError
 from fastapi.logger import logger
+from fastapi.path_params import (
+    PATH_PARAM_ERRORS_SCOPE_KEY,
+    RAW_PATH_PARAMS_SCOPE_KEY,
+    build_path_param_error,
+)
 from fastapi.security.oauth2 import SecurityScopes
 from fastapi.types import DependencyCacheKey
 from fastapi.utils import create_model_field, get_path_param_names
@@ -681,6 +686,12 @@ async def solve_dependencies(
     path_values, path_errors = request_params_to_args(
         dependant.path_params, request.path_params
     )
+    path_values, path_errors = _merge_path_param_decode_errors(
+        scope=request.scope,
+        fields=dependant.path_params,
+        values=path_values,
+        errors=path_errors,
+    )
     query_values, query_errors = request_params_to_args(
         dependant.query_params, request.query_params
     )
@@ -740,6 +751,55 @@ def _validate_value_with_model_field(
         else:
             return deepcopy(field.default), []
     return field.validate(value, values, loc=loc)
+
+
+def _merge_path_param_decode_errors(
+    *,
+    scope: Mapping[str, Any],
+    fields: Sequence[ModelField],
+    values: dict[str, Any],
+    errors: list[Any],
+) -> tuple[dict[str, Any], list[Any]]:
+    """Merge route-level path parameter decode errors into the solved errors.
+
+    Route matching records decode failures (invalid percent-encoding,
+    invalid UTF-8, decoded "." / ".." segments) in the scope. They are
+    reported here, through the normal validation error pipeline, so the
+    error location stays stable at ("path", <name>) and the message states
+    whether the raw or the decoded semantics were applied. Parameters with
+    a decode error do not also produce a regular validation error.
+    """
+    decode_errors = scope.get(PATH_PARAM_ERRORS_SCOPE_KEY)
+    if not decode_errors:
+        return values, errors
+    raw_path_params = scope.get(RAW_PATH_PARAMS_SCOPE_KEY, {})
+    errored_keys = set(decode_errors)
+    for field in fields:
+        if (
+            field.name in errored_keys
+            or get_validation_alias(field) in errored_keys
+        ):
+            values.pop(field.name, None)
+    errors = [
+        error
+        for error in errors
+        if not (
+            isinstance(error, dict)
+            and isinstance(error.get("loc"), (tuple, list))
+            and len(error["loc"]) >= 1
+            and error["loc"][0] == "path"
+            and error["loc"][-1] in errored_keys
+        )
+    ]
+    for key, decode_error in decode_errors.items():
+        errors.append(
+            build_path_param_error(
+                param_name=key,
+                raw_value=raw_path_params.get(key),
+                error=decode_error,
+            )
+        )
+    return values, errors
 
 
 def _is_json_field(field: ModelField) -> bool:

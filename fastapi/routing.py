@@ -74,6 +74,14 @@ from fastapi.exceptions import (
     ResponseValidationError,
     WebSocketRequestValidationError,
 )
+from fastapi.path_params import (
+    PATH_PARAM_ERRORS_SCOPE_KEY,
+    RAW_PATH_PARAMS_SCOPE_KEY,
+    compile_raw_path_regex,
+    get_full_raw_path,
+    match_path_params,
+    replace_path_params,
+)
 from fastapi.sse import (
     _PING_INTERVAL,
     KEEPALIVE_COMMENT,
@@ -813,6 +821,7 @@ class APIWebSocketRoute(routing.WebSocketRoute):
         self.name = get_name(endpoint) if name is None else name
         self.dependencies = list(dependencies or [])
         self.path_regex, self.path_format, self.param_convertors = compile_path(path)
+        self.raw_path_regex = compile_raw_path_regex(path)
         (
             self.dependant,
             _,
@@ -831,10 +840,29 @@ class APIWebSocketRoute(routing.WebSocketRoute):
         )
 
     def matches(self, scope: Scope) -> tuple[Match, Scope]:
-        match, child_scope = super().matches(scope)
+        if scope["type"] != "websocket":
+            return Match.NONE, {}
+        match, child_scope = _match_route_scope(
+            raw_path_regex=self.raw_path_regex,
+            path_regex=self.path_regex,
+            param_convertors=self.param_convertors,
+            endpoint=self.endpoint,
+            scope=scope,
+        )
         if match != Match.NONE:
             child_scope["route"] = self
         return match, child_scope
+
+    def url_path_for(self, name: str, /, **path_params: Any) -> URLPath:
+        seen_params = set(path_params.keys())
+        expected_params = set(self.param_convertors.keys())
+        if name != self.name or seen_params != expected_params:
+            raise NoMatchFound(name, path_params)
+        path, remaining_params = replace_path_params(
+            self.path_format, self.param_convertors, path_params
+        )
+        assert not remaining_params
+        return URLPath(path=path, protocol="websocket")
 
 
 _FASTAPI_SCOPE_KEY = "fastapi"
@@ -941,6 +969,7 @@ class _APIRouteLike(Protocol):
     responses: dict[int | str, dict[str, Any]]
     name: str
     path_regex: Any
+    raw_path_regex: Any
     path_format: str
     param_convertors: dict[str, Any]
     methods: set[str]
@@ -1016,6 +1045,7 @@ def _populate_api_route_state(
     route.responses = responses or {}
     route.name = get_name(endpoint) if name is None else name
     route.path_regex, route.path_format, route.param_convertors = compile_path(path)
+    route.raw_path_regex = compile_raw_path_regex(path)
     if methods is None:
         methods = ["GET"]
     route.methods = {method.upper() for method in methods}
@@ -1123,8 +1153,46 @@ def _populate_api_route_state(
         route.stream_item_field = None
 
 
+def _match_route_scope(
+    *,
+    raw_path_regex: Any,
+    path_regex: Any,
+    param_convertors: dict[str, Any],
+    endpoint: Any,
+    scope: Scope,
+) -> tuple[Match, Scope]:
+    """Match a route against the scope using unified raw/decoded semantics.
+
+    The path regex runs against the raw (percent-encoded) request path when
+    available, parameters are decoded exactly once, and the raw values plus
+    any decode errors are exposed in the child scope so the validation
+    pipeline can report them with stable locations.
+    """
+    result = match_path_params(
+        raw_path_regex=raw_path_regex,
+        path_regex=path_regex,
+        param_convertors=param_convertors,
+        scope=scope,
+    )
+    if result is None:
+        return Match.NONE, {}
+    path_params = dict(scope.get("path_params", {}))
+    path_params.update(result.path_params)
+    child_scope: Scope = {"endpoint": endpoint, "path_params": path_params}
+    if result.raw_path_params:
+        raw_path_params = dict(scope.get(RAW_PATH_PARAMS_SCOPE_KEY, {}))
+        raw_path_params.update(result.raw_path_params)
+        child_scope[RAW_PATH_PARAMS_SCOPE_KEY] = raw_path_params
+    if result.errors:
+        param_errors = dict(scope.get(PATH_PARAM_ERRORS_SCOPE_KEY, {}))
+        param_errors.update(result.errors)
+        child_scope[PATH_PARAM_ERRORS_SCOPE_KEY] = param_errors
+    return Match.FULL, child_scope
+
+
 class APIRoute(routing.Route):
     stream_item_type: Any | None
+    raw_path_regex: Any
     response_model: Any
     summary: str | None
     response_description: str
@@ -1253,10 +1321,35 @@ class APIRoute(routing.Route):
         if effective_context is not None and effective_context.original_route is self:
             match, child_scope = effective_context.matches(scope)
         else:
-            match, child_scope = super().matches(scope)
+            if scope["type"] != "http":
+                return Match.NONE, {}
+            match, child_scope = _match_route_scope(
+                raw_path_regex=self.raw_path_regex,
+                path_regex=self.path_regex,
+                param_convertors=self.param_convertors,
+                endpoint=self.endpoint,
+                scope=scope,
+            )
+            if (
+                match == Match.FULL
+                and self.methods
+                and scope["method"] not in self.methods
+            ):
+                match = Match.PARTIAL
         if match != Match.NONE:
             child_scope["route"] = self
         return match, child_scope
+
+    def url_path_for(self, name: str, /, **path_params: Any) -> URLPath:
+        seen_params = set(path_params.keys())
+        expected_params = set(self.param_convertors.keys())
+        if name != self.name or seen_params != expected_params:
+            raise NoMatchFound(name, path_params)
+        path, remaining_params = replace_path_params(
+            self.path_format, self.param_convertors, path_params
+        )
+        assert not remaining_params
+        return URLPath(path=path, protocol="http")
 
     async def handle(self, scope: Scope, receive: Receive, send: Send) -> None:
         effective_context = _get_scope_effective_route_context(scope)
@@ -1406,6 +1499,7 @@ class _EffectiveRouteContext:
     responses: dict[int | str, dict[str, Any]] = field(default_factory=dict)
     name: str = ""
     path_regex: Any = None
+    raw_path_regex: Any = None
     path_format: str = ""
     param_convertors: dict[str, Any] = field(default_factory=dict)
     methods: set[str] = field(default_factory=set)
@@ -1510,16 +1604,15 @@ class _EffectiveRouteContext:
             return self.starlette_route.matches(scope)
         if scope["type"] != "http":
             return Match.NONE, {}
-        route_path = get_route_path(scope)
-        match = self.path_regex.match(route_path)
-        if not match:
+        match, child_scope = _match_route_scope(
+            raw_path_regex=self.raw_path_regex,
+            path_regex=self.path_regex,
+            param_convertors=self.param_convertors,
+            endpoint=self.endpoint,
+            scope=scope,
+        )
+        if match == Match.NONE:
             return Match.NONE, {}
-        matched_params = match.groupdict()
-        for key, value in matched_params.items():
-            matched_params[key] = self.param_convertors[key].convert(value)
-        path_params = dict(scope.get("path_params", {}))
-        path_params.update(matched_params)
-        child_scope = {"endpoint": self.endpoint, "path_params": path_params}
         methods = self.methods
         if methods and scope["method"] not in methods:
             return Match.PARTIAL, child_scope
@@ -1534,7 +1627,7 @@ class _EffectiveRouteContext:
         expected_params = set(param_convertors.keys())
         if name != self.name or seen_params != expected_params:
             raise routing.NoMatchFound(name, path_params)
-        path, remaining_params = routing.replace_params(
+        path, remaining_params = replace_path_params(
             self.path_format, param_convertors, path_params
         )
         assert not remaining_params
@@ -2749,11 +2842,23 @@ class APIRouter(routing.Router):
                 redirect_scope["path"] = redirect_scope["path"].rstrip("/")
             else:
                 redirect_scope["path"] = redirect_scope["path"] + "/"
+            full_raw_path = get_full_raw_path(scope)
+            if full_raw_path is not None:
+                # Keep the raw path in sync so the redirect match below uses
+                # the same raw semantics, and so the redirect Location can
+                # preserve the original percent-encoding.
+                if route_path.endswith("/"):
+                    full_raw_path = full_raw_path.rstrip("/")
+                else:
+                    full_raw_path = full_raw_path + "/"
+                redirect_scope["raw_path"] = full_raw_path.encode("ascii")
 
             for route in self.routes:
                 match, _ = route.matches(redirect_scope)
                 if match != Match.NONE:
                     redirect_url = URL(scope=redirect_scope)
+                    if full_raw_path is not None:
+                        redirect_url = redirect_url.replace(path=full_raw_path)
                     response = RedirectResponse(url=str(redirect_url))
                     await response(scope, receive, send)
                     return
