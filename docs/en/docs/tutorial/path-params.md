@@ -237,6 +237,16 @@ In that case, the URL would be: `/files//home/johndoe/myfile.txt`, with a double
 
 ///
 
+## Percent-encoding semantics { #percent-encoding-semantics }
+
+FastAPI applies a single, consistent rule to raw and decoded path parameters, across route matching, data validation, and URL generation:
+
+* Routes are matched against the **raw** (still percent-encoded) URL path, so an encoded slash like `%2F` stays inside a single path segment and never changes the segment boundaries.
+* Each captured path parameter is percent-decoded **exactly once** (strict UTF-8) before convertors and Pydantic validation see it. Double-encoded input like `%252F` therefore arrives as the literal text `%2F`.
+* A parameter that decodes to a `.` or `..` path segment never matches, so `%2E`/`%2E%2E` cannot be used to escape the route hierarchy.
+* Invalid UTF-8 in a matched parameter is rejected with a `422` validation error located at `("path", <parameter name>)`, instead of silently bypassing validation constraints.
+* `url_path_for()`/`url_for()` re-encode parameters with the same canonical rules, so a generated URL routes back to the same decoded value (round-trip).
+
 ## Recap { #recap }
 
 With **FastAPI**, by using short, intuitive and standard Python type declarations, you get:
