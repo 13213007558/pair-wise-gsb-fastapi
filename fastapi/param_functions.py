@@ -1817,7 +1817,9 @@ def Form(  # noqa: N802
         bool | None,
         Doc(
             """
-            If `True`, strict validation is applied to the field.
+            If `True`, enable strict multi-value handling: a scalar (non-list)
+            field sent more than once in the same form will be rejected with a
+            422 error instead of silently using the last value.
             """
         ),
     ] = _Unset,
@@ -2132,7 +2134,9 @@ def File(  # noqa: N802
         bool | None,
         Doc(
             """
-            If `True`, strict validation is applied to the field.
+            If `True`, enable strict multi-value handling: a scalar (non-list)
+            field sent more than once in the same form will be rejected with a
+            422 error instead of silently using the last value.
             """
         ),
     ] = _Unset,

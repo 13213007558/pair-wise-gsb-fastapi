@@ -625,6 +625,12 @@ class Form(Body):  # type: ignore[misc]
         json_schema_extra: dict[str, Any] | None = None,
         **extra: Any,
     ):
+        # `strict` is intentionally not forwarded to Pydantic: form data is
+        # always received as strings (or files), so Pydantic's strict mode
+        # would reject valid input. Instead, it enables strict multi-value
+        # handling: scalar fields declared with `strict=True` reject requests
+        # that send the same field more than once with a 422 error.
+        self.strict_form = strict if strict is not _Unset else None
         super().__init__(
             default=default,
             default_factory=default_factory,
@@ -645,7 +651,6 @@ class Form(Body):  # type: ignore[misc]
             pattern=pattern,
             regex=regex,
             discriminator=discriminator,
-            strict=strict,
             multiple_of=multiple_of,
             allow_inf_nan=allow_inf_nan,
             max_digits=max_digits,

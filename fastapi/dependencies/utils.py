@@ -45,7 +45,6 @@ from fastapi._compat import (
     is_uploadfile_or_nonable_uploadfile_annotation,
     is_uploadfile_sequence_annotation,
     lenient_issubclass,
-    sequence_types,
     serialize_sequence_value,
     value_is_sequence,
 )
@@ -746,34 +745,68 @@ def _is_json_field(field: ModelField) -> bool:
     return any(type(item) is Json for item in field.field_info.metadata)
 
 
+class _MultipleFormValues:
+    """
+    Sentinel returned by `_get_multidict_value()` when a scalar (non-sequence)
+    form field declared with `strict=True` receives more than one value.
+    """
+
+    def __init__(self, values: list[Any]) -> None:
+        self.values = values
+
+
+def _get_multiple_values_error(
+    *, loc: tuple[str, ...], values: list[Any]
+) -> dict[str, Any]:
+    return {
+        "type": "multiple_values",
+        "loc": loc,
+        "msg": f"Expected a single value, got {len(values)} values",
+        "input": [value if isinstance(value, str) else str(value) for value in values],
+        "ctx": {"count": len(values)},
+    }
+
+
 def _get_multidict_value(
-    field: ModelField, values: Mapping[str, Any], alias: str | None = None
+    field: ModelField,
+    values: Mapping[str, Any],
+    alias: str | None = None,
+    from_form: bool = False,
 ) -> Any:
+    """
+    Extract the raw value for a field from a mapping, keeping multi-value
+    semantics for multidicts (query params, headers, form data).
+
+    Returns `None` when the field is considered missing. When `from_form` is
+    `True`, empty strings (including empty file upload parts) are treated as
+    missing values, both for scalar fields and inside sequences. Scalar fields
+    declared with `strict=True` return a `_MultipleFormValues` sentinel when
+    they receive more than one value; otherwise the last value wins.
+    """
     alias = alias or get_validation_alias(field)
-    if (
-        (not _is_json_field(field))
-        and field_annotation_is_sequence(field.field_info.annotation)
-        and isinstance(values, (ImmutableMultiDict, Headers))
-    ):
-        value = values.getlist(alias)
+    annotation = field.field_info.annotation
+    is_sequence = (not _is_json_field(field)) and field_annotation_is_sequence(
+        annotation
+    )
+    if is_sequence and isinstance(values, (ImmutableMultiDict, Headers)):
+        value: Any = values.getlist(alias)
+        if from_form:
+            value = [item for item in value if item != ""]
+    elif from_form and isinstance(values, (ImmutableMultiDict, Headers)):
+        items = [item for item in values.getlist(alias) if item != ""]
+        if len(items) > 1 and getattr(field.field_info, "strict_form", None):
+            return _MultipleFormValues(items)
+        value = items[-1] if items else None
     else:
         value = values.get(alias, None)
     if (
         value is None
-        or (
-            isinstance(field.field_info, params.Form)
-            and isinstance(value, str)  # For type checks
-            and value == ""
-        )
-        or (
-            field_annotation_is_sequence(field.field_info.annotation)
-            and len(value) == 0
-        )
+        or (from_form and isinstance(value, str) and value == "")
+        or (is_sequence and value_is_sequence(value) and len(value) == 0)
     ):
         if field.field_info.is_required():
-            return
-        else:
-            return deepcopy(field.default)
+            return None
+        return deepcopy(field.default)
     return value
 
 
@@ -909,35 +942,65 @@ def _should_embed_body_fields(fields: list[ModelField]) -> bool:
     return False
 
 
-async def _extract_form_body(
-    body_fields: list[ModelField],
-    received_body: FormData,
-) -> dict[str, Any]:
-    values = {}
-
-    for field in body_fields:
-        value = _get_multidict_value(field, received_body)
-        field_info = field.field_info
-        if (
-            isinstance(field_info, params.File)
-            and is_bytes_or_nonable_bytes_annotation(field.field_info.annotation)
-            and isinstance(value, UploadFile)
-        ):
-            value = await value.read()
-        elif (
-            is_bytes_sequence_annotation(field.field_info.annotation)
-            and isinstance(field_info, params.File)
-            and value_is_sequence(value)
-        ):
-            # For types
-            assert isinstance(value, sequence_types)
-            results: list[bytes | str] = []
-            for sub_value in value:
+async def _read_uploadfile_value(*, field: ModelField, value: Any) -> Any:
+    """
+    Read the content of uploaded files for fields annotated as `bytes` (or
+    sequences of `bytes`), leaving any other value untouched.
+    """
+    annotation = field.field_info.annotation
+    if is_bytes_or_nonable_bytes_annotation(annotation) and isinstance(
+        value, UploadFile
+    ):
+        return await value.read()
+    if is_bytes_sequence_annotation(annotation) and value_is_sequence(value):
+        results: list[bytes | str] = []
+        for sub_value in value:
+            if isinstance(sub_value, UploadFile):
                 results.append(await sub_value.read())
-            value = serialize_sequence_value(field=field, value=results)
+            else:
+                results.append(sub_value)
+        return serialize_sequence_value(field=field, value=results)
+    return value
+
+
+def _form_data_to_dict(received_body: FormData) -> dict[str, Any]:
+    """
+    Convert form data to a plain dict without losing repeated fields: keys
+    submitted multiple times map to the list of their values, in order.
+    """
+    values: dict[str, Any] = {}
+    for key in received_body.keys():
+        param_values = received_body.getlist(key)
+        if len(param_values) == 1:
+            values[key] = param_values[0]
+        else:
+            values[key] = param_values
+    return values
+
+
+async def _extract_form_model_body(
+    field: ModelField, received_body: FormData
+) -> tuple[dict[str, Any], list[dict[str, Any]]]:
+    """
+    Extract the values for each field of a Pydantic model received as form
+    data, keeping multi-value semantics (repeated fields, empty strings and
+    empty file parts) instead of flattening the form into a plain dict first.
+    """
+    values: dict[str, Any] = {}
+    errors: list[dict[str, Any]] = []
+    model_fields = get_cached_model_fields(field.field_info.annotation)
+    for model_field in model_fields:
+        alias = get_validation_alias(model_field)
+        value = _get_multidict_value(model_field, received_body, from_form=True)
+        if isinstance(value, _MultipleFormValues):
+            errors.append(
+                _get_multiple_values_error(loc=("body", alias), values=value.values)
+            )
+            continue
+        value = await _read_uploadfile_value(field=model_field, value=value)
         if value is not None:
-            values[get_validation_alias(field)] = value
-    field_aliases = {get_validation_alias(field) for field in body_fields}
+            values[alias] = value
+    field_aliases = {get_validation_alias(model_field) for model_field in model_fields}
     for key in received_body.keys():
         if key not in field_aliases:
             param_values = received_body.getlist(key)
@@ -945,7 +1008,7 @@ async def _extract_form_body(
                 values[key] = param_values[0]
             else:
                 values[key] = param_values
-    return values
+    return values, errors
 
 
 async def request_body_to_args(
@@ -958,29 +1021,57 @@ async def request_body_to_args(
     assert body_fields, "request_body_to_args() should be called with fields"
     single_not_embedded_field = len(body_fields) == 1 and not embed_body_fields
     first_field = body_fields[0]
-    body_to_process = received_body
-
-    fields_to_extract: list[ModelField] = body_fields
-
-    if (
-        single_not_embedded_field
-        and lenient_issubclass(first_field.field_info.annotation, BaseModel)
-        and isinstance(received_body, FormData)
-    ):
-        fields_to_extract = get_cached_model_fields(first_field.field_info.annotation)
 
     if isinstance(received_body, FormData):
-        body_to_process = await _extract_form_body(fields_to_extract, received_body)
+        # Don't convert the whole form to a dict up front, that would lose
+        # repeated fields. Extract each field from the multidict instead.
+        if single_not_embedded_field:
+            if lenient_issubclass(first_field.field_info.annotation, BaseModel):
+                body_to_process, form_errors = await _extract_form_model_body(
+                    first_field, received_body
+                )
+                if form_errors:
+                    errors.extend(form_errors)
+                    return values, errors
+            else:
+                # A single field that is not a Pydantic model (e.g. a union of
+                # models), keep repeated values as lists so nothing is lost.
+                body_to_process = _form_data_to_dict(received_body)
+            loc: tuple[str, ...] = ("body",)
+            v_, errors_ = _validate_value_with_model_field(
+                field=first_field, value=body_to_process, values=values, loc=loc
+            )
+            errors.extend(errors_)
+            return {first_field.name: v_}, errors
+        for field in body_fields:
+            alias = get_validation_alias(field)
+            loc = ("body", alias)
+            value = _get_multidict_value(field, received_body, from_form=True)
+            if isinstance(value, _MultipleFormValues):
+                errors.append(
+                    _get_multiple_values_error(loc=loc, values=value.values)
+                )
+                continue
+            value = await _read_uploadfile_value(field=field, value=value)
+            v_, errors_ = _validate_value_with_model_field(
+                field=field, value=value, values=values, loc=loc
+            )
+            if errors_:
+                errors.extend(errors_)
+            else:
+                values[field.name] = v_
+        return values, errors
 
+    body_to_process = received_body
     if single_not_embedded_field:
-        loc: tuple[str, ...] = ("body",)
+        loc = ("body",)
         v_, errors_ = _validate_value_with_model_field(
             field=first_field, value=body_to_process, values=values, loc=loc
         )
         return {first_field.name: v_}, errors_
     for field in body_fields:
         loc = ("body", get_validation_alias(field))
-        value: Any | None = None
+        value = None
         if body_to_process is not None and not isinstance(body_to_process, bytes):
             try:
                 value = body_to_process.get(get_validation_alias(field))
@@ -996,6 +1087,26 @@ async def request_body_to_args(
         else:
             values[field.name] = v_
     return values, errors
+
+
+def _annotation_contains_uploadfile(annotation: Any) -> bool:
+    """
+    Check if a Pydantic model annotation (or a union of Pydantic models)
+    contains fields that receive uploaded files.
+    """
+    if lenient_issubclass(annotation, BaseModel):
+        return any(
+            is_uploadfile_or_nonable_uploadfile_annotation(
+                model_field.field_info.annotation
+            )
+            or is_uploadfile_sequence_annotation(model_field.field_info.annotation)
+            for model_field in get_cached_model_fields(annotation)
+        )
+    if is_union_of_base_models(annotation):
+        return any(
+            _annotation_contains_uploadfile(arg) for arg in get_args(annotation)
+        )
+    return False
 
 
 def _get_body_field(
@@ -1015,6 +1126,15 @@ def _get_body_field(
         return None
     first_param = body_params[0]
     if not embed_body_fields:
+        first_field_info = first_param.field_info
+        if (
+            isinstance(first_field_info, params.Form)
+            and first_field_info.media_type == "application/x-www-form-urlencoded"
+            and _annotation_contains_uploadfile(first_field_info.annotation)
+        ):
+            # A form model (or union of form models) with file fields can only
+            # be received as multipart/form-data, reflect it in the OpenAPI.
+            first_field_info.media_type = "multipart/form-data"
         return first_param
     model_name = "Body_" + name
     BodyModel = create_body_model(fields=body_params, model_name=model_name)
@@ -1029,6 +1149,11 @@ def _get_body_field(
         BodyFieldInfo: type[params.Body] = params.File
     elif any(isinstance(f.field_info, params.Form) for f in body_params):
         BodyFieldInfo = params.Form
+        if any(
+            _annotation_contains_uploadfile(f.field_info.annotation)
+            for f in body_params
+        ):
+            BodyFieldInfo_kwargs["media_type"] = "multipart/form-data"
     else:
         BodyFieldInfo = params.Body
 

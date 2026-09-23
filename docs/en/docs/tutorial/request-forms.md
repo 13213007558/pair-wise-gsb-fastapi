@@ -68,6 +68,34 @@ This is not a limitation of **FastAPI**, it's part of the HTTP protocol.
 
 ///
 
+## Repeated Form Fields { #repeated-form-fields }
+
+HTML forms can send the same field several times. If you declare the parameter
+as a sequence (`list`, `set`, `tuple`, ...), every submitted value is kept, in
+the order the client sent them:
+
+```Python
+@app.post("/items/")
+async def create_items(tags: list[str] = Form()):
+    return {"tags": tags}
+```
+
+If a single-value (scalar) field is sent several times, the last value is used
+by default. Pass `strict=True` to reject such requests with a `422` response
+instead:
+
+```Python
+@app.post("/items/")
+async def create_item(name: str = Form(strict=True)):
+    return {"name": name}
+```
+
+For form data, an empty string (and an empty file upload) is treated as if the
+field was not sent, so parameters with a default value receive their default
+(and `Optional` parameters receive `None`). These rules also apply to the
+fields of Pydantic models declared with `Form()`, and the same semantics work
+for `File()` parameters.
+
 ## Recap { #recap }
 
 Use `Form` to declare form data input parameters.
