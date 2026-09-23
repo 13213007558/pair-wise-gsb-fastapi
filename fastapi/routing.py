@@ -42,6 +42,7 @@ from typing import (
 import anyio
 from annotated_doc import Doc
 from anyio.abc import ObjectReceiveStream
+from pydantic import ValidationError as PydanticValidationError
 from fastapi import params
 from fastapi._compat import (
     ModelField,
@@ -72,6 +73,7 @@ from fastapi.exceptions import (
     FastAPIError,
     RequestValidationError,
     ResponseValidationError,
+    WebSocketException,
     WebSocketRequestValidationError,
 )
 from fastapi.sse import (
@@ -94,6 +96,9 @@ from starlette._utils import get_route_path, is_async_callable
 from starlette.concurrency import iterate_in_threadpool, run_in_threadpool
 from starlette.datastructures import URL, FormData, URLPath
 from starlette.exceptions import HTTPException
+from starlette.exceptions import (
+    WebSocketException as StarletteWebSocketException,
+)
 from starlette.requests import Request
 from starlette.responses import (
     JSONResponse,
@@ -111,8 +116,13 @@ from starlette.routing import (
 )
 from starlette.routing import Mount as Mount  # noqa
 from starlette.staticfiles import StaticFiles
+from starlette.status import WS_1008_POLICY_VIOLATION
 from starlette.types import AppType, ASGIApp, Lifespan, Receive, Scope, Send
-from starlette.websockets import WebSocket
+from fastapi.websockets import WebSocket
+from starlette.websockets import (
+    WebSocketDisconnect,
+    WebSocketState,
+)
 from typing_extensions import deprecated
 
 
@@ -160,8 +170,60 @@ def request_response(
     return app
 
 
-# Copy of starlette.routing.websocket_session modified to include the
-# dependencies' AsyncExitStack
+# WebSocket dependencies have separate pre-accept and post-accept boundaries.
+def _websocket_exception_from_http_exception(
+    exc: HTTPException,
+) -> WebSocketException:
+    detail = exc.detail if isinstance(exc.detail, str) else json.dumps(exc.detail)
+    return WebSocketException(code=WS_1008_POLICY_VIOLATION, reason=detail)
+
+
+def _endpoint_context(dependant: Dependant, websocket: WebSocket) -> EndpointContext:
+    endpoint_ctx = (
+        _extract_endpoint_context(dependant.call)
+        if dependant.call
+        else EndpointContext()
+    )
+    if dependant.path:
+        mount_path = websocket.scope.get("root_path", "").rstrip("/")
+        endpoint_ctx["path"] = f"WS {mount_path}{dependant.path}"
+    return endpoint_ctx
+
+
+async def _solve_websocket_dependencies(
+    *,
+    websocket: WebSocket,
+    dependant: Dependant,
+    dependency_overrides_provider: Any | None,
+    embed_body_fields: bool,
+    request_stack: AsyncExitStack,
+    function_stack: AsyncExitStack,
+) -> SolvedDependency:
+    scope = websocket.scope
+    missing = object()
+    previous_request_stack = scope.get("fastapi_inner_astack", missing)
+    previous_function_stack = scope.get("fastapi_function_astack", missing)
+    scope["fastapi_inner_astack"] = request_stack
+    scope["fastapi_function_astack"] = function_stack
+    try:
+        return await solve_dependencies(
+            request=websocket,
+            dependant=dependant,
+            dependency_overrides_provider=dependency_overrides_provider,
+            async_exit_stack=request_stack,
+            embed_body_fields=embed_body_fields,
+        )
+    finally:
+        if previous_request_stack is missing:
+            scope.pop("fastapi_inner_astack", None)
+        else:
+            scope["fastapi_inner_astack"] = previous_request_stack
+        if previous_function_stack is missing:
+            scope.pop("fastapi_function_astack", None)
+        else:
+            scope["fastapi_function_astack"] = previous_function_stack
+
+
 def websocket_session(
     func: Callable[[WebSocket], Awaitable[None]],
 ) -> ASGIApp:
@@ -174,11 +236,14 @@ def websocket_session(
         session = WebSocket(scope, receive=receive, send=send)
 
         async def app(scope: Scope, receive: Receive, send: Send) -> None:
-            async with AsyncExitStack() as request_stack:
-                scope["fastapi_inner_astack"] = request_stack
-                async with AsyncExitStack() as function_stack:
-                    scope["fastapi_function_astack"] = function_stack
-                    await func(session)
+            try:
+                await func(session)
+            except HTTPException as exc:
+                if session.application_state != WebSocketState.CONNECTING:
+                    raise _websocket_exception_from_http_exception(exc) from exc
+                raise
+            except StarletteWebSocketException:
+                raise
 
         # Same as in Starlette
         await wrap_app_handling_exceptions(app, session)(scope, receive, send)
@@ -767,33 +832,54 @@ def get_websocket_app(
     embed_body_fields: bool = False,
 ) -> Callable[[WebSocket], Coroutine[Any, Any, Any]]:
     async def app(websocket: WebSocket) -> None:
-        endpoint_ctx = (
-            _extract_endpoint_context(dependant.call)
-            if dependant.call
-            else EndpointContext()
-        )
-        if dependant.path:
-            # For mounted sub-apps, include the mount path prefix
-            mount_path = websocket.scope.get("root_path", "").rstrip("/")
-            endpoint_ctx["path"] = f"WS {mount_path}{dependant.path}"
-        async_exit_stack = websocket.scope.get("fastapi_inner_astack")
-        assert isinstance(async_exit_stack, AsyncExitStack), (
-            "fastapi_inner_astack not found in request scope"
-        )
-        solved_result = await solve_dependencies(
-            request=websocket,
-            dependant=dependant,
-            dependency_overrides_provider=dependency_overrides_provider,
-            async_exit_stack=async_exit_stack,
-            embed_body_fields=embed_body_fields,
-        )
-        if solved_result.errors:
-            raise WebSocketRequestValidationError(
-                solved_result.errors,
-                endpoint_ctx=endpoint_ctx,
-            )
         assert dependant.call is not None, "dependant.call must be a function"
-        await dependant.call(**solved_result.values)
+        endpoint_ctx = _endpoint_context(dependant, websocket)
+        disconnect: WebSocketDisconnect | None = None
+        completed = False
+        try:
+            async with AsyncExitStack() as request_stack:
+                async with AsyncExitStack() as function_stack:
+                    solved_result = await _solve_websocket_dependencies(
+                        websocket=websocket,
+                        dependant=dependant,
+                        dependency_overrides_provider=dependency_overrides_provider,
+                        embed_body_fields=embed_body_fields,
+                        request_stack=request_stack,
+                        function_stack=function_stack,
+                    )
+                    if solved_result.errors:
+                        raise WebSocketRequestValidationError(
+                            solved_result.errors,
+                            endpoint_ctx=endpoint_ctx,
+                        )
+                    try:
+                        await dependant.call(**solved_result.values)
+                    except WebSocketDisconnect as exc:
+                        disconnect = exc
+                    except PydanticValidationError as exc:
+                        raise WebSocketRequestValidationError(
+                            exc.errors(),
+                            endpoint_ctx=endpoint_ctx,
+                        ) from exc
+                    completed = True
+
+                background_tasks = solved_result.background_tasks
+                if background_tasks is not None:
+                    await background_tasks()
+            if disconnect is not None:
+                raise disconnect
+        except PydanticValidationError as exc:
+            raise WebSocketRequestValidationError(
+                exc.errors(),
+                endpoint_ctx=endpoint_ctx,
+            ) from exc
+        if completed and not websocket.scope.get(
+            "fastapi.websocket_close_sent"
+        ) and (
+            websocket.application_state == WebSocketState.CONNECTED
+            and websocket.client_state == WebSocketState.CONNECTED
+        ):
+            await websocket.close()
 
     return app
 

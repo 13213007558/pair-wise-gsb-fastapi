@@ -9,6 +9,7 @@ from fastapi.datastructures import Default, DefaultPlaceholder
 from fastapi.exception_handlers import (
     http_exception_handler,
     request_validation_exception_handler,
+    websocket_exception_handler,
     websocket_request_validation_exception_handler,
 )
 from fastapi.exceptions import RequestValidationError, WebSocketRequestValidationError
@@ -26,6 +27,7 @@ from fastapi.utils import generate_unique_id
 from starlette.applications import Starlette
 from starlette.datastructures import State
 from starlette.exceptions import HTTPException
+from starlette.exceptions import WebSocketException as StarletteWebSocketException
 from starlette.middleware import Middleware
 from starlette.middleware.base import BaseHTTPMiddleware
 from starlette.middleware.errors import ServerErrorMiddleware
@@ -1010,6 +1012,10 @@ class FastAPI(Starlette):
             WebSocketRequestValidationError,
             websocket_request_validation_exception_handler,  # type: ignore[arg-type]
         )  # ty: ignore[no-matching-overload]
+        self.exception_handlers.setdefault(
+            StarletteWebSocketException,
+            websocket_exception_handler,  # type: ignore[arg-type]
+        )
 
         self.user_middleware: list[Middleware] = (
             [] if middleware is None else list(middleware)
