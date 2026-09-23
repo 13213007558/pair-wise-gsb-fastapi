@@ -66,6 +66,7 @@ from fastapi.dependencies.models import (
 )
 from fastapi.exceptions import DependencyScopeError
 from fastapi.logger import logger
+from fastapi.security.requirement import AnonymousSecurity, SecurityRequirement
 from fastapi.security.oauth2 import SecurityScopes
 from fastapi.types import DependencyCacheKey
 from fastapi.utils import create_model_field, get_path_param_names
@@ -82,6 +83,8 @@ from starlette.datastructures import (
 )
 from starlette.requests import HTTPConnection, Request
 from starlette.responses import Response
+from starlette.status import HTTP_401_UNAUTHORIZED, HTTP_403_FORBIDDEN
+from starlette.exceptions import HTTPException
 from starlette.websockets import WebSocket
 from typing_inspection.typing_objects import is_typealiastype
 
@@ -278,6 +281,7 @@ def get_dependant(
     use_cache: bool = True,
     scope: Literal["function", "request"] | None = None,
 ) -> Dependant:
+    security_requirement = call if isinstance(call, SecurityRequirement) else None
     dependant = Dependant(
         call=call,
         name=name,
@@ -286,7 +290,20 @@ def get_dependant(
         scope=scope,
         own_oauth_scopes=own_oauth_scopes,
         parent_oauth_scopes=parent_oauth_scopes,
+        security_requirement=security_requirement,
     )
+    if security_requirement is not None:
+        for security_dependency in security_requirement.dependencies:
+            sub_dependant = get_dependant(
+                path=path,
+                call=security_dependency.dependency,
+                own_oauth_scopes=list(security_dependency.scopes or []),
+                parent_oauth_scopes=current_scopes,
+                use_cache=security_dependency.use_cache,
+                scope=security_dependency.scope,
+            )
+            dependant.dependencies.append(sub_dependant)
+        return dependant
     current_scopes = (parent_oauth_scopes or []) + (own_oauth_scopes or [])
     path_param_names = get_path_param_names(path)
     endpoint_signature = get_typed_signature(call)
@@ -574,6 +591,219 @@ async def _solve_generator(
     return await stack.enter_async_context(cm)
 
 
+def _get_override_dependant(
+    *,
+    sub_dependant: Dependant,
+    dependency_overrides_provider: Any | None,
+) -> tuple[Callable[..., Any], Dependant]:
+    original_call = sub_dependant.call
+    call = original_call
+    use_sub_dependant = sub_dependant
+    if (
+        dependency_overrides_provider
+        and dependency_overrides_provider.dependency_overrides
+    ):
+        call = getattr(
+            dependency_overrides_provider, "dependency_overrides", {}
+        ).get(original_call, original_call)
+        if call is not original_call:
+            use_sub_dependant = get_dependant(
+                path=sub_dependant.path,
+                call=call,
+                name=sub_dependant.name,
+                parent_oauth_scopes=_get_oauth_scopes(dependant=sub_dependant),
+                scope=sub_dependant.scope,
+            )
+    return cast(Callable[..., Any], call), use_sub_dependant
+
+
+async def _invoke_dependency(
+    *,
+    call: Callable[..., Any],
+    dependant: Dependant,
+    values: dict[str, Any],
+    request: Request | WebSocket,
+) -> Any:
+    request_astack = request.scope.get("fastapi_inner_astack")
+    assert isinstance(request_astack, AsyncExitStack)
+    function_astack = request.scope.get("fastapi_function_astack")
+    assert isinstance(function_astack, AsyncExitStack)
+    if _is_gen_callable(call) or _is_async_gen_callable(call):
+        use_astack = request_astack
+        if dependant.scope == "function":
+            use_astack = function_astack
+        return await _solve_generator(
+            dependant=dependant,
+            stack=use_astack,
+            sub_values=values,
+        )
+    if _is_coroutine_callable(call):
+        return await call(**values)
+    return await run_in_threadpool(call, **values)
+
+
+def _collect_security_challenges(dependant: Dependant) -> list[tuple[str, str]]:
+    challenges: list[tuple[str, str]] = []
+    dependants = [dependant]
+    while dependants:
+        current = dependants.pop()
+        if _is_security_scheme(dependant=current) and current.call is not None:
+            scheme = _get_security_scheme(dependant=current)
+            challenge = scheme.make_not_authenticated_error().headers.get(
+                "WWW-Authenticate", ""
+            )
+            scopes = _get_oauth_scopes(dependant=current)
+            if scopes and challenge.lower().startswith("bearer"):
+                scope_value = " ".join(scopes)
+                challenge = f'{challenge.rstrip()} scope="{scope_value}"'
+            challenges.append((scheme.scheme_name, challenge))
+        dependants.extend(reversed(current.dependencies))
+    return challenges
+
+
+def _merge_www_authenticate(values: list[str]) -> str | None:
+    challenges: list[str] = []
+    for value in values:
+        for challenge in value.split(","):
+            challenge = challenge.strip()
+            if challenge and challenge not in challenges:
+                challenges.append(challenge)
+    return ", ".join(challenges) if challenges else None
+
+
+def _combined_security_error(
+    *,
+    errors: list[HTTPException],
+    missing_challenges: list[str],
+    allow_anonymous: bool,
+) -> HTTPException | None:
+    if not errors and ((missing_challenges and not allow_anonymous) or not missing_challenges):
+        return None
+    if not errors and allow_anonymous:
+        return None
+
+    challenges = missing_challenges + [
+        value
+        for error in errors
+        for value in [error.headers.get("WWW-Authenticate") if error.headers else None]
+        if value
+    ]
+    www_authenticate = _merge_www_authenticate(challenges)
+    status_code = (
+        HTTP_403_FORBIDDEN
+        if any(error.status_code == HTTP_403_FORBIDDEN for error in errors)
+        else HTTP_401_UNAUTHORIZED
+    )
+    preferred_error = next(
+        (error for error in errors if error.status_code == status_code),
+        errors[0] if errors else None,
+    )
+    headers = dict(preferred_error.headers) if preferred_error and preferred_error.headers else {}
+    if www_authenticate:
+        headers["WWW-Authenticate"] = www_authenticate
+    detail = preferred_error.detail if preferred_error else "Not authenticated"
+    return HTTPException(status_code=status_code, detail=detail, headers=headers)
+
+
+async def _solve_security_requirement(
+    *,
+    dependant: Dependant,
+    request: Request | WebSocket,
+    body: dict[str, Any] | FormData | bytes | None,
+    background_tasks: StarletteBackgroundTasks | None,
+    response: Response,
+    dependency_overrides_provider: Any | None,
+    dependency_cache: dict[DependencyCacheKey, Any],
+    async_exit_stack: AsyncExitStack,
+    embed_body_fields: bool,
+    uses_scopes_cache: _UsesScopesCache,
+) -> Any:
+    requirement = cast(SecurityRequirement, dependant.security_requirement)
+    errors: list[HTTPException] = []
+    missing_challenges: list[str] = []
+
+    for alternative in dependant.dependencies:
+        call, use_alternative = _get_override_dependant(
+            sub_dependant=alternative,
+            dependency_overrides_provider=dependency_overrides_provider,
+        )
+        branch_cache: dict[DependencyCacheKey, Any] = {}
+        branch_inner_stack = AsyncExitStack()
+        branch_function_stack = AsyncExitStack()
+        await branch_inner_stack.__aenter__()
+        await branch_function_stack.__aenter__()
+        original_inner_stack = request.scope["fastapi_inner_astack"]
+        original_function_stack = request.scope["fastapi_function_astack"]
+        request.scope["fastapi_inner_astack"] = branch_inner_stack
+        request.scope["fastapi_function_astack"] = branch_function_stack
+        branch_succeeded = False
+        try:
+            solved_result = await solve_dependencies(
+                request=request,
+                dependant=use_alternative,
+                body=body,
+                background_tasks=None,
+                response=None,
+                dependency_overrides_provider=dependency_overrides_provider,
+                dependency_cache=branch_cache,
+                async_exit_stack=branch_inner_stack,
+                embed_body_fields=embed_body_fields,
+                _uses_scopes_cache=uses_scopes_cache,
+            )
+            if solved_result.errors:
+                from fastapi.exceptions import RequestValidationError
+
+                raise RequestValidationError(solved_result.errors)
+            solved = await _invoke_dependency(
+                call=call,
+                dependant=use_alternative,
+                values=solved_result.values,
+                request=request,
+            )
+        except HTTPException as error:
+            await branch_function_stack.aclose()
+            await branch_inner_stack.aclose()
+            errors.append(error)
+            continue
+        except BaseException:
+            await branch_function_stack.aclose()
+            await branch_inner_stack.aclose()
+            raise
+        finally:
+            request.scope["fastapi_inner_astack"] = original_inner_stack
+            request.scope["fastapi_function_astack"] = original_function_stack
+
+        branch_succeeded = True
+        async_exit_stack.push_async_callback(branch_inner_stack.aclose)
+        async_exit_stack.push_async_callback(branch_function_stack.aclose)
+        dependency_cache.update(branch_cache)
+        if solved_result.response.headers:
+            response.headers.raw.extend(solved_result.response.headers.raw)
+        if solved_result.response.status_code:
+            response.status_code = solved_result.response.status_code
+        if solved_result.background_tasks is not None:
+            background_tasks = solved_result.background_tasks
+        if solved is not None:
+            return solved, background_tasks
+        if not branch_succeeded:
+            continue
+
+        for _, challenge in _collect_security_challenges(use_alternative):
+            if challenge not in missing_challenges:
+                missing_challenges.append(challenge)
+
+    if not errors and requirement.allow_anonymous:
+        return AnonymousSecurity, background_tasks
+    error = _combined_security_error(
+        errors=errors,
+        missing_challenges=missing_challenges,
+        allow_anonymous=requirement.allow_anonymous,
+    )
+    if error is not None:
+        raise error
+    return AnonymousSecurity, background_tasks
+
+
 @dataclass
 class SolvedDependency:
     values: dict[str, Any]
@@ -618,24 +848,10 @@ async def solve_dependencies(
         _uses_scopes_cache = {}
     for sub_dependant in dependant.dependencies:
         sub_dependant.call = cast(Callable[..., Any], sub_dependant.call)
-        call = sub_dependant.call
-        use_sub_dependant = sub_dependant
-        if (
-            dependency_overrides_provider
-            and dependency_overrides_provider.dependency_overrides
-        ):
-            original_call = sub_dependant.call
-            call = getattr(
-                dependency_overrides_provider, "dependency_overrides", {}
-            ).get(original_call, original_call)
-            use_path: str = sub_dependant.path  # type: ignore
-            use_sub_dependant = get_dependant(
-                path=use_path,
-                call=call,
-                name=sub_dependant.name,
-                parent_oauth_scopes=_get_oauth_scopes(dependant=sub_dependant),
-                scope=sub_dependant.scope,
-            )
+        call, use_sub_dependant = _get_override_dependant(
+            sub_dependant=sub_dependant,
+            dependency_overrides_provider=dependency_overrides_provider,
+        )
 
         solved_result = await solve_dependencies(
             request=request,
@@ -659,24 +875,33 @@ async def solve_dependencies(
         )
         if sub_dependant.use_cache and sub_dependant_cache_key in dependency_cache:
             solved = dependency_cache[sub_dependant_cache_key]
-        elif _is_gen_callable(use_sub_dependant.call) or _is_async_gen_callable(
-            use_sub_dependant.call
-        ):
-            use_astack = request_astack
-            if sub_dependant.scope == "function":
-                use_astack = function_astack
-            solved = await _solve_generator(
-                dependant=use_sub_dependant,
-                stack=use_astack,
-                sub_values=solved_result.values,
-            )
-        elif _is_coroutine_callable(use_sub_dependant.call):
-            solved = await call(**solved_result.values)
         else:
-            solved = await run_in_threadpool(call, **solved_result.values)
+            if sub_dependant.security_requirement is not None:
+                solved, background_tasks = await _solve_security_requirement(
+                    dependant=sub_dependant,
+                    request=request,
+                    body=body,
+                    background_tasks=background_tasks,
+                    response=response,
+                    dependency_overrides_provider=dependency_overrides_provider,
+                    dependency_cache=dependency_cache,
+                    async_exit_stack=request_astack,
+                    embed_body_fields=embed_body_fields,
+                    uses_scopes_cache=_uses_scopes_cache,
+                )
+            else:
+                solved = await _invoke_dependency(
+                    call=call,
+                    dependant=use_sub_dependant,
+                    values=solved_result.values,
+                    request=request,
+                )
         if sub_dependant.name is not None:
             values[sub_dependant.name] = solved
-        if sub_dependant_cache_key not in dependency_cache:
+        if (
+            sub_dependant.security_requirement is None
+            and sub_dependant_cache_key not in dependency_cache
+        ):
             dependency_cache[sub_dependant_cache_key] = solved
     path_values, path_errors = request_params_to_args(
         dependant.path_params, request.path_params
