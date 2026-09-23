@@ -59,13 +59,19 @@ from fastapi.dependencies.models import (
     _get_cache_key,
     _get_computed_scope,
     _get_oauth_scopes,
+    _get_security_or_group,
     _is_async_gen_callable,
     _is_coroutine_callable,
     _is_gen_callable,
+    _is_security_or_group,
     _UsesScopesCache,
 )
 from fastapi.exceptions import DependencyScopeError
 from fastapi.logger import logger
+from fastapi.security.base import (
+    _is_missing_credentials_error,
+    _mark_missing_credentials,
+)
 from fastapi.security.oauth2 import SecurityScopes
 from fastapi.types import DependencyCacheKey
 from fastapi.utils import create_model_field, get_path_param_names
@@ -80,8 +86,10 @@ from starlette.datastructures import (
     QueryParams,
     UploadFile,
 )
+from starlette.exceptions import HTTPException
 from starlette.requests import HTTPConnection, Request
 from starlette.responses import Response
+from starlette.status import HTTP_401_UNAUTHORIZED
 from starlette.websockets import WebSocket
 from typing_inspection.typing_objects import is_typealiastype
 
@@ -344,6 +352,20 @@ def get_dependant(
             dependant.body_params.append(param_details.field)
         else:
             add_param_to_fields(field=param_details.field, dependant=dependant)
+    if _is_security_or_group(dependant=dependant):
+        # A security AnyOf group is declarative: expand its sub-schemes as
+        # sub-dependencies, they are solved with OR (any-of) semantics in
+        # solve_dependencies() and expressed as multiple security requirement
+        # objects in OpenAPI
+        or_group = _get_security_or_group(dependant=dependant)
+        for scheme in or_group.schemes:
+            sub_dependant = get_dependant(
+                path=path,
+                # Security schemes and nested AnyOf groups are all callable
+                call=cast(Callable[..., Any], scheme),
+                parent_oauth_scopes=current_scopes,
+            )
+            dependant.dependencies.append(sub_dependant)
     return dependant
 
 
@@ -574,6 +596,177 @@ async def _solve_generator(
     return await stack.enter_async_context(cm)
 
 
+def _resolve_sub_dependant_override(
+    *,
+    sub_dependant: Dependant,
+    dependency_overrides_provider: Any | None,
+) -> tuple[Callable[..., Any], Dependant]:
+    call: Callable[..., Any] = cast(Callable[..., Any], sub_dependant.call)
+    use_sub_dependant = sub_dependant
+    if (
+        dependency_overrides_provider
+        and dependency_overrides_provider.dependency_overrides
+    ):
+        original_call = cast(Callable[..., Any], sub_dependant.call)
+        call = getattr(
+            dependency_overrides_provider, "dependency_overrides", {}
+        ).get(original_call, original_call)
+        use_path: str = sub_dependant.path  # type: ignore
+        use_sub_dependant = get_dependant(
+            path=use_path,
+            call=call,
+            name=sub_dependant.name,
+            parent_oauth_scopes=_get_oauth_scopes(dependant=sub_dependant),
+            scope=sub_dependant.scope,
+        )
+    return call, use_sub_dependant
+
+
+async def _run_sub_dependant_call(
+    *,
+    request: Request | WebSocket,
+    sub_dependant: Dependant,
+    use_sub_dependant: Dependant,
+    call: Callable[..., Any],
+    sub_values: dict[str, Any],
+    dependency_cache: dict[DependencyCacheKey, Any],
+    uses_scopes_cache: _UsesScopesCache,
+) -> Any:
+    sub_dependant_cache_key = _get_cache_key(
+        dependant=sub_dependant,
+        uses_scopes_cache=uses_scopes_cache,
+    )
+    if sub_dependant.use_cache and sub_dependant_cache_key in dependency_cache:
+        return dependency_cache[sub_dependant_cache_key]
+    if _is_gen_callable(use_sub_dependant.call) or _is_async_gen_callable(
+        use_sub_dependant.call
+    ):
+        use_astack = request.scope.get("fastapi_inner_astack")
+        if sub_dependant.scope == "function":
+            use_astack = request.scope.get("fastapi_function_astack")
+        assert isinstance(use_astack, AsyncExitStack)
+        solved = await _solve_generator(
+            dependant=use_sub_dependant,
+            stack=use_astack,
+            sub_values=sub_values,
+        )
+    elif _is_coroutine_callable(use_sub_dependant.call):
+        solved = await call(**sub_values)
+    else:
+        solved = await run_in_threadpool(call, **sub_values)
+    if sub_dependant_cache_key not in dependency_cache:
+        dependency_cache[sub_dependant_cache_key] = solved
+    return solved
+
+
+async def _solve_security_or_group(
+    *,
+    request: Request | WebSocket,
+    group_dependant: Dependant,
+    body: dict[str, Any] | FormData | bytes | None,
+    background_tasks: StarletteBackgroundTasks | None,
+    response: Response,
+    dependency_overrides_provider: Any | None,
+    dependency_cache: dict[DependencyCacheKey, Any],
+    async_exit_stack: AsyncExitStack,
+    embed_body_fields: bool,
+    uses_scopes_cache: _UsesScopesCache,
+) -> tuple[Any, StarletteBackgroundTasks | None]:
+    """
+    Solve a security AnyOf group with OR (any-of) semantics.
+
+    Each sub-scheme (alternative) is tried in declaration order, the first one
+    that authenticates the request wins and its result is the result of the
+    group. If no alternative succeeds:
+
+    * If any alternative rejected provided credentials (invalid credentials),
+      the first such error is raised.
+    * Otherwise (credentials were missing for all alternatives), if the group
+      allows anonymous access, the result is None (explicit anonymous).
+    * Otherwise a 401 "Not authenticated" error is raised, combining the
+      WWW-Authenticate challenges of all the alternatives.
+    """
+    or_group = _get_security_or_group(dependant=group_dependant)
+    missing_credentials_errors: list[HTTPException] = []
+    invalid_credentials_errors: list[HTTPException] = []
+    for alternative in group_dependant.dependencies:
+        call, use_alternative = _resolve_sub_dependant_override(
+            sub_dependant=alternative,
+            dependency_overrides_provider=dependency_overrides_provider,
+        )
+        try:
+            if _is_security_or_group(dependant=use_alternative):
+                # Nested AnyOf group, solve it recursively. A nested group
+                # result of None means explicit anonymous access, which is a
+                # valid (successful) result
+                return await _solve_security_or_group(
+                    request=request,
+                    group_dependant=use_alternative,
+                    body=body,
+                    background_tasks=background_tasks,
+                    response=response,
+                    dependency_overrides_provider=dependency_overrides_provider,
+                    dependency_cache=dependency_cache,
+                    async_exit_stack=async_exit_stack,
+                    embed_body_fields=embed_body_fields,
+                    uses_scopes_cache=uses_scopes_cache,
+                )
+            solved_result = await solve_dependencies(
+                request=request,
+                dependant=use_alternative,
+                body=body,
+                background_tasks=background_tasks,
+                response=response,
+                dependency_overrides_provider=dependency_overrides_provider,
+                dependency_cache=dependency_cache,
+                async_exit_stack=async_exit_stack,
+                embed_body_fields=embed_body_fields,
+                _uses_scopes_cache=uses_scopes_cache,
+            )
+            if solved_result.errors:
+                # Validation errors in one alternative don't prevent trying
+                # the other alternatives
+                continue
+            solved = await _run_sub_dependant_call(
+                request=request,
+                sub_dependant=alternative,
+                use_sub_dependant=use_alternative,
+                call=call,
+                sub_values=solved_result.values,
+                dependency_cache=dependency_cache,
+                uses_scopes_cache=uses_scopes_cache,
+            )
+        except HTTPException as e:
+            if _is_missing_credentials_error(e):
+                missing_credentials_errors.append(e)
+            else:
+                invalid_credentials_errors.append(e)
+            continue
+        if solved is None:
+            # Schemes with auto_error=False return None when the credentials
+            # are missing, try the next alternative
+            continue
+        return solved, solved_result.background_tasks
+    if invalid_credentials_errors:
+        raise invalid_credentials_errors[0]
+    if or_group.allow_anonymous:
+        return None, background_tasks
+    challenges: list[str] = []
+    for error in missing_credentials_errors:
+        error_headers = error.headers or {}
+        challenge = error_headers.get("WWW-Authenticate")
+        if challenge and challenge not in challenges:
+            challenges.append(challenge)
+    headers = {"WWW-Authenticate": ", ".join(challenges)} if challenges else None
+    raise _mark_missing_credentials(
+        HTTPException(
+            status_code=HTTP_401_UNAUTHORIZED,
+            detail="Not authenticated",
+            headers=headers,
+        )
+    )
+
+
 @dataclass
 class SolvedDependency:
     values: dict[str, Any]
@@ -618,25 +811,35 @@ async def solve_dependencies(
         _uses_scopes_cache = {}
     for sub_dependant in dependant.dependencies:
         sub_dependant.call = cast(Callable[..., Any], sub_dependant.call)
-        call = sub_dependant.call
-        use_sub_dependant = sub_dependant
-        if (
-            dependency_overrides_provider
-            and dependency_overrides_provider.dependency_overrides
-        ):
-            original_call = sub_dependant.call
-            call = getattr(
-                dependency_overrides_provider, "dependency_overrides", {}
-            ).get(original_call, original_call)
-            use_path: str = sub_dependant.path  # type: ignore
-            use_sub_dependant = get_dependant(
-                path=use_path,
-                call=call,
-                name=sub_dependant.name,
-                parent_oauth_scopes=_get_oauth_scopes(dependant=sub_dependant),
-                scope=sub_dependant.scope,
+        call, use_sub_dependant = _resolve_sub_dependant_override(
+            sub_dependant=sub_dependant,
+            dependency_overrides_provider=dependency_overrides_provider,
+        )
+        if _is_security_or_group(dependant=use_sub_dependant):
+            sub_dependant_cache_key = _get_cache_key(
+                dependant=sub_dependant,
+                uses_scopes_cache=_uses_scopes_cache,
             )
-
+            if sub_dependant.use_cache and sub_dependant_cache_key in dependency_cache:
+                solved = dependency_cache[sub_dependant_cache_key]
+            else:
+                solved, background_tasks = await _solve_security_or_group(
+                    request=request,
+                    group_dependant=use_sub_dependant,
+                    body=body,
+                    background_tasks=background_tasks,
+                    response=response,
+                    dependency_overrides_provider=dependency_overrides_provider,
+                    dependency_cache=dependency_cache,
+                    async_exit_stack=async_exit_stack,
+                    embed_body_fields=embed_body_fields,
+                    uses_scopes_cache=_uses_scopes_cache,
+                )
+                if sub_dependant_cache_key not in dependency_cache:
+                    dependency_cache[sub_dependant_cache_key] = solved
+            if sub_dependant.name is not None:
+                values[sub_dependant.name] = solved
+            continue
         solved_result = await solve_dependencies(
             request=request,
             dependant=use_sub_dependant,
@@ -653,31 +856,17 @@ async def solve_dependencies(
         if solved_result.errors:
             errors.extend(solved_result.errors)
             continue
-        sub_dependant_cache_key = _get_cache_key(
-            dependant=sub_dependant,
+        solved = await _run_sub_dependant_call(
+            request=request,
+            sub_dependant=sub_dependant,
+            use_sub_dependant=use_sub_dependant,
+            call=call,
+            sub_values=solved_result.values,
+            dependency_cache=dependency_cache,
             uses_scopes_cache=_uses_scopes_cache,
         )
-        if sub_dependant.use_cache and sub_dependant_cache_key in dependency_cache:
-            solved = dependency_cache[sub_dependant_cache_key]
-        elif _is_gen_callable(use_sub_dependant.call) or _is_async_gen_callable(
-            use_sub_dependant.call
-        ):
-            use_astack = request_astack
-            if sub_dependant.scope == "function":
-                use_astack = function_astack
-            solved = await _solve_generator(
-                dependant=use_sub_dependant,
-                stack=use_astack,
-                sub_values=solved_result.values,
-            )
-        elif _is_coroutine_callable(use_sub_dependant.call):
-            solved = await call(**solved_result.values)
-        else:
-            solved = await run_in_threadpool(call, **solved_result.values)
         if sub_dependant.name is not None:
             values[sub_dependant.name] = solved
-        if sub_dependant_cache_key not in dependency_cache:
-            dependency_cache[sub_dependant_cache_key] = solved
     path_values, path_errors = request_params_to_args(
         dependant.path_params, request.path_params
     )

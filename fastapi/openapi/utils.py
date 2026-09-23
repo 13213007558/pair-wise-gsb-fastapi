@@ -20,7 +20,9 @@ from fastapi.dependencies.models import (
     Dependant,
     _get_cache_key,
     _get_oauth_scopes,
+    _get_security_or_group,
     _get_security_scheme,
+    _is_security_or_group,
     _is_security_scheme,
     _UsesScopesCache,
 )
@@ -94,6 +96,7 @@ class _OpenAPIDependencyData:
     security_dependencies: list[tuple[Dependant, list[str]]] = field(
         default_factory=list
     )
+    allows_anonymous: bool = False
 
 
 def _get_openapi_dependency_data(dependant: Dependant) -> _OpenAPIDependencyData:
@@ -118,7 +121,14 @@ def _get_openapi_dependency_data(dependant: Dependant) -> _OpenAPIDependencyData
         for scope in _get_oauth_scopes(dependant=current_dependant):
             if scope not in oauth_scopes:
                 oauth_scopes.append(scope)
-        if not is_root and _is_security_scheme(dependant=current_dependant):
+        if _is_security_or_group(dependant=current_dependant):
+            # A security AnyOf group is not a security scheme by itself, its
+            # sub-schemes are collected as (OR-ed) security dependencies when
+            # visiting them below
+            or_group = _get_security_or_group(dependant=current_dependant)
+            if or_group.allow_anonymous:
+                dependency_data.allows_anonymous = True
+        elif not is_root and _is_security_scheme(dependant=current_dependant):
             dependency_data.security_dependencies.append(
                 (current_dependant, oauth_scopes)
             )
@@ -131,6 +141,7 @@ def _get_openapi_dependency_data(dependant: Dependant) -> _OpenAPIDependencyData
 
 def _get_openapi_security_definitions(
     security_dependencies: list[tuple[Dependant, list[str]]],
+    allows_anonymous: bool = False,
 ) -> tuple[dict[str, Any], list[dict[str, Any]]]:
     security_definitions = {}
     # Use a dict to merge scopes for same security scheme
@@ -153,6 +164,10 @@ def _get_openapi_security_definitions(
     operation_security = [
         {name: scopes} for name, scopes in operation_security_dict.items()
     ]
+    if allows_anonymous and operation_security:
+        # An empty security requirement object makes authentication optional
+        # (anonymous access allowed), OR-ed with the other requirements
+        operation_security.append({})
     return security_definitions, operation_security
 
 
@@ -347,7 +362,8 @@ def get_openapi_path(
             parameters: list[dict[str, Any]] = []
             security_definitions, operation_security = (
                 _get_openapi_security_definitions(
-                    security_dependencies=dependency_data.security_dependencies
+                    security_dependencies=dependency_data.security_dependencies,
+                    allows_anonymous=dependency_data.allows_anonymous,
                 )
             )
             if operation_security:

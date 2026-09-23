@@ -6,7 +6,7 @@ from annotated_doc import Doc
 from fastapi.exceptions import HTTPException
 from fastapi.openapi.models import HTTPBase as HTTPBaseModel
 from fastapi.openapi.models import HTTPBearer as HTTPBearerModel
-from fastapi.security.base import SecurityBase
+from fastapi.security.base import SecurityBase, _mark_missing_credentials
 from fastapi.security.utils import get_authorization_scheme_param
 from pydantic import BaseModel
 from starlette.requests import Request
@@ -85,6 +85,19 @@ class HTTPBase(SecurityBase):
         return {"WWW-Authenticate": f"{self.model.scheme.title()}"}
 
     def make_not_authenticated_error(self) -> HTTPException:
+        return _mark_missing_credentials(
+            HTTPException(
+                status_code=HTTP_401_UNAUTHORIZED,
+                detail="Not authenticated",
+                headers=self.make_authenticate_headers(),
+            )
+        )
+
+    def make_invalid_credentials_error(self) -> HTTPException:
+        # The response is the same as for missing credentials, but it is not
+        # flagged as "missing credentials": the client did provide credentials,
+        # they are just malformed. This is used by AnyOf to avoid falling back
+        # to anonymous access when credentials were provided but rejected.
         return HTTPException(
             status_code=HTTP_401_UNAUTHORIZED,
             detail="Not authenticated",
@@ -212,10 +225,10 @@ class HTTPBasic(HTTPBase):
         try:
             data = b64decode(param).decode("ascii")
         except (ValueError, UnicodeDecodeError, binascii.Error) as e:
-            raise self.make_not_authenticated_error() from e
+            raise self.make_invalid_credentials_error() from e
         username, separator, password = data.partition(":")
         if not separator:
-            raise self.make_not_authenticated_error()
+            raise self.make_invalid_credentials_error()
         return HTTPBasicCredentials(username=username, password=password)
 
 

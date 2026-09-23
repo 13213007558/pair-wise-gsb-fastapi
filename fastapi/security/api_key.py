@@ -2,7 +2,7 @@ from typing import Annotated
 
 from annotated_doc import Doc
 from fastapi.openapi.models import APIKey, APIKeyIn
-from fastapi.security.base import SecurityBase
+from fastapi.security.base import SecurityBase, _mark_missing_credentials
 from starlette.exceptions import HTTPException
 from starlette.requests import Request
 from starlette.status import HTTP_401_UNAUTHORIZED
@@ -38,10 +38,12 @@ class APIKeyBase(SecurityBase):
 
         For this, this method sends a custom challenge `APIKey`.
         """
-        return HTTPException(
-            status_code=HTTP_401_UNAUTHORIZED,
-            detail="Not authenticated",
-            headers={"WWW-Authenticate": "APIKey"},
+        return _mark_missing_credentials(
+            HTTPException(
+                status_code=HTTP_401_UNAUTHORIZED,
+                detail="Not authenticated",
+                headers={"WWW-Authenticate": "APIKey"},
+            )
         )
 
     def check_api_key(self, api_key: str | None) -> str | None:

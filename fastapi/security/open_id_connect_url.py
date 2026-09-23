@@ -2,7 +2,7 @@ from typing import Annotated
 
 from annotated_doc import Doc
 from fastapi.openapi.models import OpenIdConnect as OpenIdConnectModel
-from fastapi.security.base import SecurityBase
+from fastapi.security.base import SecurityBase, _mark_missing_credentials
 from starlette.exceptions import HTTPException
 from starlette.requests import Request
 from starlette.status import HTTP_401_UNAUTHORIZED
@@ -78,10 +78,12 @@ class OpenIdConnect(SecurityBase):
         self.auto_error = auto_error
 
     def make_not_authenticated_error(self) -> HTTPException:
-        return HTTPException(
-            status_code=HTTP_401_UNAUTHORIZED,
-            detail="Not authenticated",
-            headers={"WWW-Authenticate": "Bearer"},
+        return _mark_missing_credentials(
+            HTTPException(
+                status_code=HTTP_401_UNAUTHORIZED,
+                detail="Not authenticated",
+                headers={"WWW-Authenticate": "Bearer"},
+            )
         )
 
     async def __call__(self, request: Request) -> str | None:

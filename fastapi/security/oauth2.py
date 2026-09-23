@@ -5,7 +5,7 @@ from fastapi.exceptions import HTTPException
 from fastapi.openapi.models import OAuth2 as OAuth2Model
 from fastapi.openapi.models import OAuthFlows as OAuthFlowsModel
 from fastapi.param_functions import Form
-from fastapi.security.base import SecurityBase
+from fastapi.security.base import SecurityBase, _mark_missing_credentials
 from fastapi.security.utils import get_authorization_scheme_param
 from starlette.requests import Request
 from starlette.status import HTTP_401_UNAUTHORIZED
@@ -414,10 +414,12 @@ class OAuth2(SecurityBase):
 
         Ref: https://datatracker.ietf.org/doc/html/rfc6749
         """
-        return HTTPException(
-            status_code=HTTP_401_UNAUTHORIZED,
-            detail="Not authenticated",
-            headers={"WWW-Authenticate": "Bearer"},
+        return _mark_missing_credentials(
+            HTTPException(
+                status_code=HTTP_401_UNAUTHORIZED,
+                detail="Not authenticated",
+                headers={"WWW-Authenticate": "Bearer"},
+            )
         )
 
     async def __call__(self, request: Request) -> str | None:
