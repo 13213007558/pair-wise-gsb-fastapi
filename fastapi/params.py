@@ -579,6 +579,14 @@ class Body(FieldInfo):  # type: ignore[misc]  # ty: ignore[subclass-of-final-cla
 
 
 class Form(Body):  # type: ignore[misc]
+    # When True, form parsing is strict: multiple values for a non-sequence
+    # field are rejected with a 422 error instead of silently using the last
+    # one, and empty strings are validated as-is instead of being treated as
+    # missing values. This is handled by FastAPI itself, it is not forwarded
+    # to Pydantic as field strictness (form data is always strings, so
+    # Pydantic-level strict validation would reject valid input).
+    strict: bool | None
+
     def __init__(
         self,
         default: Any = Undefined,
@@ -625,6 +633,7 @@ class Form(Body):  # type: ignore[misc]
         json_schema_extra: dict[str, Any] | None = None,
         **extra: Any,
     ):
+        self.strict = strict if strict is not _Unset else None
         super().__init__(
             default=default,
             default_factory=default_factory,
@@ -645,7 +654,6 @@ class Form(Body):  # type: ignore[misc]
             pattern=pattern,
             regex=regex,
             discriminator=discriminator,
-            strict=strict,
             multiple_of=multiple_of,
             allow_inf_nan=allow_inf_nan,
             max_digits=max_digits,

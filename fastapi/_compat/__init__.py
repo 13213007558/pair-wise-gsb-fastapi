@@ -32,6 +32,7 @@ from .v2 import get_definitions as get_definitions
 from .v2 import get_flat_models_from_fields as get_flat_models_from_fields
 from .v2 import get_missing_field_error as get_missing_field_error
 from .v2 import get_model_name_map as get_model_name_map
+from .v2 import get_multiple_values_error as get_multiple_values_error
 from .v2 import get_schema_from_model_field as get_schema_from_model_field
 from .v2 import is_scalar_field as is_scalar_field
 from .v2 import serialize_sequence_value as serialize_sequence_value

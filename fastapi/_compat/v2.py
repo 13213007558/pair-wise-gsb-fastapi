@@ -30,7 +30,7 @@ from pydantic.fields import FieldInfo as FieldInfo
 from pydantic.json_schema import GenerateJsonSchema as _GenerateJsonSchema
 from pydantic.json_schema import JsonSchemaValue as JsonSchemaValue
 from pydantic_core import CoreSchema as CoreSchema
-from pydantic_core import PydanticUndefined
+from pydantic_core import PydanticCustomError, PydanticUndefined
 from pydantic_core import Url as Url
 from pydantic_core.core_schema import (
     with_info_plain_validator_function as with_info_plain_validator_function,
@@ -381,6 +381,21 @@ def get_missing_field_error(loc: tuple[int | str, ...]) -> dict[str, Any]:
         "Field required", [{"type": "missing", "loc": loc, "input": {}}]
     ).errors(include_url=False)[0]
     error["input"] = None
+    return error  # type: ignore[return-value]  # ty: ignore[invalid-return-type]
+
+
+def get_multiple_values_error(
+    loc: tuple[int | str, ...], values: Sequence[Any]
+) -> dict[str, Any]:
+    custom_error = PydanticCustomError(
+        "multiple_values",
+        "Expected a single value, but got {count} values",
+        {"count": len(values)},
+    )
+    error = ValidationError.from_exception_data(
+        "Multiple values",
+        [{"type": custom_error, "loc": loc, "input": list(values)}],
+    ).errors(include_url=False)[0]
     return error  # type: ignore[return-value]  # ty: ignore[invalid-return-type]
 
 

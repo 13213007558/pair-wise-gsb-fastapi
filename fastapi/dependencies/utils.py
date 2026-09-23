@@ -39,6 +39,7 @@ from fastapi._compat import (
     field_annotation_is_sequence,
     get_cached_model_fields,
     get_missing_field_error,
+    get_multiple_values_error,
     is_bytes_or_nonable_bytes_annotation,
     is_bytes_sequence_annotation,
     is_scalar_field,
@@ -746,29 +747,56 @@ def _is_json_field(field: ModelField) -> bool:
     return any(type(item) is Json for item in field.field_info.metadata)
 
 
+def _is_form_file_annotation(annotation: Any) -> bool:
+    return is_uploadfile_or_nonable_uploadfile_annotation(
+        annotation
+    ) or is_bytes_or_nonable_bytes_annotation(annotation)
+
+
+def _is_form_file_sequence_annotation(annotation: Any) -> bool:
+    if is_uploadfile_sequence_annotation(annotation):
+        return True
+    return is_bytes_sequence_annotation(annotation)
+
+
 def _get_multidict_value(
-    field: ModelField, values: Mapping[str, Any], alias: str | None = None
+    field: ModelField,
+    values: Mapping[str, Any],
+    alias: str | None = None,
+    form_context: bool = False,
+    strict_form: bool = False,
 ) -> Any:
     alias = alias or get_validation_alias(field)
+    annotation = field.field_info.annotation
+    is_form_field = form_context or isinstance(field.field_info, params.Form)
     if (
         (not _is_json_field(field))
-        and field_annotation_is_sequence(field.field_info.annotation)
+        and field_annotation_is_sequence(annotation)
         and isinstance(values, (ImmutableMultiDict, Headers))
     ):
         value = values.getlist(alias)
+        if is_form_field and _is_form_file_sequence_annotation(annotation):
+            # File parts with an empty filename (what browsers send when no
+            # file was selected) are parsed as empty strings, they are not
+            # real values, so they are discarded
+            value = [v for v in value if not (isinstance(v, str) and v == "")]
     else:
         value = values.get(alias, None)
+    empty_string_is_missing = is_form_field and (
+        not strict_form
+        # An empty string for a file field is an empty file part (empty
+        # filename), it means "no file", not an actual value, even in
+        # strict mode
+        or _is_form_file_annotation(annotation)
+    )
     if (
         value is None
         or (
-            isinstance(field.field_info, params.Form)
+            empty_string_is_missing
             and isinstance(value, str)  # For type checks
             and value == ""
         )
-        or (
-            field_annotation_is_sequence(field.field_info.annotation)
-            and len(value) == 0
-        )
+        or (field_annotation_is_sequence(annotation) and len(value) == 0)
     ):
         if field.field_info.is_required():
             return
@@ -912,12 +940,43 @@ def _should_embed_body_fields(fields: list[ModelField]) -> bool:
 async def _extract_form_body(
     body_fields: list[ModelField],
     received_body: FormData,
-) -> dict[str, Any]:
-    values = {}
-
+    strict: bool = False,
+) -> tuple[dict[str, Any], list[dict[str, Any]]]:
+    values: dict[str, Any] = {}
+    errors: list[dict[str, Any]] = []
     for field in body_fields:
-        value = _get_multidict_value(field, received_body)
         field_info = field.field_info
+        field_strict = strict or (
+            isinstance(field_info, params.Form)
+            and bool(getattr(field_info, "strict", None))
+        )
+        alias = get_validation_alias(field)
+        if (
+            field_strict
+            and not _is_json_field(field)
+            and not field_annotation_is_sequence(field_info.annotation)
+        ):
+            multi_values: list[Any] = list(received_body.getlist(alias))
+            if _is_form_file_annotation(field_info.annotation):
+                # Ignore empty file parts (empty filename), they are not
+                # real values
+                multi_values = [
+                    v for v in multi_values if not (isinstance(v, str) and v == "")
+                ]
+            if len(multi_values) > 1:
+                errors.append(
+                    get_multiple_values_error(
+                        loc=("body", alias),
+                        values=[
+                            v.filename if isinstance(v, UploadFile) else v
+                            for v in multi_values
+                        ],
+                    )
+                )
+                continue
+        value = _get_multidict_value(
+            field, received_body, form_context=True, strict_form=field_strict
+        )
         if (
             isinstance(field_info, params.File)
             and is_bytes_or_nonable_bytes_annotation(field.field_info.annotation)
@@ -936,7 +995,7 @@ async def _extract_form_body(
                 results.append(await sub_value.read())
             value = serialize_sequence_value(field=field, value=results)
         if value is not None:
-            values[get_validation_alias(field)] = value
+            values[alias] = value
     field_aliases = {get_validation_alias(field) for field in body_fields}
     for key in received_body.keys():
         if key not in field_aliases:
@@ -945,7 +1004,7 @@ async def _extract_form_body(
                 values[key] = param_values[0]
             else:
                 values[key] = param_values
-    return values
+    return values, errors
 
 
 async def request_body_to_args(
@@ -969,16 +1028,39 @@ async def request_body_to_args(
     ):
         fields_to_extract = get_cached_model_fields(first_field.field_info.annotation)
 
+    form_errors: list[dict[str, Any]] = []
     if isinstance(received_body, FormData):
-        body_to_process = await _extract_form_body(fields_to_extract, received_body)
+        # A strict Form() (or File()) on a single non-embedded field (e.g. a
+        # Pydantic model) applies to all the fields extracted from it,
+        # embedded fields each carry their own strict flag
+        strict_form_body = single_not_embedded_field and bool(
+            getattr(first_field.field_info, "strict", None)
+        )
+        body_to_process, form_errors = await _extract_form_body(
+            fields_to_extract, received_body, strict=strict_form_body
+        )
+        errors.extend(form_errors)
+    form_error_aliases = {
+        error["loc"][1] for error in form_errors if len(error.get("loc", ())) > 1
+    }
 
     if single_not_embedded_field:
         loc: tuple[str, ...] = ("body",)
         v_, errors_ = _validate_value_with_model_field(
             field=first_field, value=body_to_process, values=values, loc=loc
         )
-        return {first_field.name: v_}, errors_
+        # Don't report fields that already have an extraction error (e.g.
+        # multiple values for a scalar field in strict mode), they would
+        # otherwise show up again as missing or invalid
+        errors.extend(
+            error
+            for error in errors_
+            if not (len(error["loc"]) > 1 and error["loc"][1] in form_error_aliases)
+        )
+        return {first_field.name: v_}, errors
     for field in body_fields:
+        if get_validation_alias(field) in form_error_aliases:
+            continue
         loc = ("body", get_validation_alias(field))
         value: Any | None = None
         if body_to_process is not None and not isinstance(body_to_process, bytes):

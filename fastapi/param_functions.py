@@ -1817,7 +1817,10 @@ def Form(  # noqa: N802
         bool | None,
         Doc(
             """
-            If `True`, strict validation is applied to the field.
+            If `True`, use strict form parsing: multiple values for a
+            non-sequence field are rejected with a 422 error instead of
+            silently using the last one, and empty strings are validated
+            as-is instead of being treated as missing values.
             """
         ),
     ] = _Unset,
@@ -2132,7 +2135,10 @@ def File(  # noqa: N802
         bool | None,
         Doc(
             """
-            If `True`, strict validation is applied to the field.
+            If `True`, use strict form parsing: multiple values for a
+            non-sequence field are rejected with a 422 error instead of
+            silently using the last one, and empty strings are validated
+            as-is instead of being treated as missing values.
             """
         ),
     ] = _Unset,
