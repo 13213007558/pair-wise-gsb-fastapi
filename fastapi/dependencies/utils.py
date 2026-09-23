@@ -708,7 +708,10 @@ async def solve_dependencies(
         errors.extend(body_errors)
     if dependant.http_connection_param_name:
         values[dependant.http_connection_param_name] = request
-    if dependant.request_param_name and isinstance(request, Request):
+    # A WebSocket is also an HTTPConnection, dependencies (e.g. security
+    # schemes) that ask for a Request can use it for the HTTP parts (headers,
+    # query params, cookies) of the WebSocket handshake
+    if dependant.request_param_name and isinstance(request, (Request, WebSocket)):
         values[dependant.request_param_name] = request
     elif dependant.websocket_param_name and isinstance(request, WebSocket):
         values[dependant.websocket_param_name] = request

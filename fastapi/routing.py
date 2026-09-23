@@ -91,6 +91,7 @@ from fastapi.utils import (
 from starlette import routing
 from starlette._exception_handler import wrap_app_handling_exceptions
 from starlette._utils import get_route_path, is_async_callable
+from starlette.background import BackgroundTasks as StarletteBackgroundTasks
 from starlette.concurrency import iterate_in_threadpool, run_in_threadpool
 from starlette.datastructures import URL, FormData, URLPath
 from starlette.exceptions import HTTPException
@@ -112,7 +113,7 @@ from starlette.routing import (
 from starlette.routing import Mount as Mount  # noqa
 from starlette.staticfiles import StaticFiles
 from starlette.types import AppType, ASGIApp, Lifespan, Receive, Scope, Send
-from starlette.websockets import WebSocket
+from starlette.websockets import WebSocket, WebSocketDisconnect
 from typing_extensions import deprecated
 
 
@@ -163,10 +164,14 @@ def request_response(
 # Copy of starlette.routing.websocket_session modified to include the
 # dependencies' AsyncExitStack
 def websocket_session(
-    func: Callable[[WebSocket], Awaitable[None]],
+    func: Callable[[WebSocket], Awaitable[StarletteBackgroundTasks | None]],
 ) -> ASGIApp:
     """
-    Takes a coroutine `func(session)`, and returns an ASGI application.
+    Takes a coroutine func(session), and returns an ASGI application.
+
+    func can return background tasks to run after the endpoint (and the
+    function-scope dependencies) are done, but before the request-scope
+    dependencies are cleaned up.
     """
     # assert asyncio.iscoroutinefunction(func), "WebSocket endpoints must be async"
 
@@ -176,12 +181,22 @@ def websocket_session(
         async def app(scope: Scope, receive: Receive, send: Send) -> None:
             async with AsyncExitStack() as request_stack:
                 scope["fastapi_inner_astack"] = request_stack
+                background_tasks: StarletteBackgroundTasks | None = None
                 async with AsyncExitStack() as function_stack:
                     scope["fastapi_function_astack"] = function_stack
-                    await func(session)
+                    background_tasks = await func(session)
+                if background_tasks:
+                    await background_tasks()
 
-        # Same as in Starlette
-        await wrap_app_handling_exceptions(app, session)(scope, receive, send)
+        try:
+            # Same as in Starlette
+            await wrap_app_handling_exceptions(app, session)(scope, receive, send)
+        except WebSocketDisconnect:
+            # The client disconnected, there's nothing else to do: the
+            # dependencies were already cleaned up exactly once by the
+            # AsyncExitStack, and no close message can be sent back to a
+            # client that is already gone.
+            pass
 
     return app
 
@@ -765,8 +780,8 @@ def get_websocket_app(
     dependant: Dependant,
     dependency_overrides_provider: Any | None = None,
     embed_body_fields: bool = False,
-) -> Callable[[WebSocket], Coroutine[Any, Any, Any]]:
-    async def app(websocket: WebSocket) -> None:
+) -> Callable[[WebSocket], Coroutine[Any, Any, StarletteBackgroundTasks | None]]:
+    async def app(websocket: WebSocket) -> StarletteBackgroundTasks | None:
         endpoint_ctx = (
             _extract_endpoint_context(dependant.call)
             if dependant.call
@@ -794,6 +809,7 @@ def get_websocket_app(
             )
         assert dependant.call is not None, "dependant.call must be a function"
         await dependant.call(**solved_result.values)
+        return solved_result.background_tasks
 
     return app
 

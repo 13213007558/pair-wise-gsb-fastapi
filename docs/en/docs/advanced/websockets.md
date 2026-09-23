@@ -119,6 +119,51 @@ You can use a closing code from the [valid codes defined in the specification](h
 
 ///
 
+## Dependency cleanup and exit timeline { #dependency-cleanup-and-exit-timeline }
+
+Dependencies (including dependencies with `yield`) are solved **before** the WebSocket endpoint runs, so their setup code always runs before `await websocket.accept()`.
+
+The exit code of dependencies with `yield` (the code after the `yield`) runs **after** the endpoint finishes, in reverse order of setup, and exactly once, no matter how the connection ends.
+
+### Errors before the handshake { #errors-before-the-handshake }
+
+If a dependency fails before `await websocket.accept()`, the handshake is rejected:
+
+* `HTTPException` (including the ones raised by `Security` utilities): the handshake is rejected with the corresponding HTTP response, with the status code, headers, and `detail` from the exception.
+* `WebSocketException`: the handshake is rejected with a WebSocket close using the exception's `code` and `reason`.
+* Validation errors (e.g. a missing query parameter): the handshake is rejected with a WebSocket close with code `1008` and the validation errors as the reason.
+
+/// note
+
+When the handshake is rejected with a WebSocket close (instead of an `HTTPException`), the close code and reason are not delivered to the client, as the WebSocket protocol doesn't support them before the connection is established. The client only sees that the handshake was rejected (e.g. with an HTTP `403`). If you need the client to receive the error details, raise an `HTTPException` instead.
+
+///
+
+### Errors after the handshake { #errors-after-the-handshake }
+
+If something fails after `await websocket.accept()`:
+
+* `WebSocketException`: the connection is closed with the exception's `code` and `reason`.
+* `HTTPException`: the connection is closed with code `1008` (for 4xx status codes) or `1011` (for 5xx status codes), with the `detail` as the reason.
+
+### Disconnections, closing, and cancellation { #disconnections-closing-and-cancellation }
+
+* **Client disconnection**: when the client disconnects, `WebSocketDisconnect` is raised in the endpoint. If the endpoint doesn't catch it, FastAPI handles it gracefully: the dependencies are cleaned up and nothing else is sent to the (already gone) client.
+* **Endpoint closes the connection**: after `await websocket.close()`, the endpoint returns and the dependencies are cleaned up. FastAPI never sends a second close message, even if the dependency cleanup or an exception handler raises afterwards.
+* **Cancellation**: if the server cancels the connection (e.g. during shutdown), the dependency cleanup runs once and the cancellation continues to propagate.
+* **Errors in dependency cleanup**: if the exit code of a dependency with `yield` raises, the error propagates to your middleware, exception handlers, or the server, so you can detect and log it. If the connection was already closed, no second close message is sent.
+
+### Background tasks { #websocket-background-tasks }
+
+You can declare a `BackgroundTasks` parameter in a WebSocket endpoint. The background tasks run after the endpoint finishes, after dependencies with `scope="function"` are cleaned up, and before dependencies with `scope="request"` (the default) are cleaned up, the same order as for HTTP requests.
+
+### Unsupported phases { #unsupported-phases }
+
+Some things are not supported in WebSocket endpoints, because of the nature of the WebSocket protocol:
+
+* The exit code of dependencies with `yield` runs after the connection is already closed, so it cannot `accept()`, send messages, or `close()` the connection again.
+* `Response` parameters, response models, and HTTP status codes don't apply to WebSocket connections, use `WebSocketException` with a close code instead.
+
 ### Try the WebSockets with dependencies { #try-the-websockets-with-dependencies }
 
 Run your application:

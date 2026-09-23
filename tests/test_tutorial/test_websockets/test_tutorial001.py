@@ -1,6 +1,4 @@
-import pytest
 from fastapi.testclient import TestClient
-from fastapi.websockets import WebSocketDisconnect
 
 from docs_src.websockets_.tutorial001_py310 import app
 
@@ -14,13 +12,14 @@ def test_main():
 
 
 def test_websocket():
-    with pytest.raises(WebSocketDisconnect):
-        with client.websocket_connect("/ws") as websocket:
-            message = "Message one"
-            websocket.send_text(message)
-            data = websocket.receive_text()
-            assert data == f"Message text was: {message}"
-            message = "Message two"
-            websocket.send_text(message)
-            data = websocket.receive_text()
-            assert data == f"Message text was: {message}"
+    # The endpoint doesn't handle WebSocketDisconnect itself, FastAPI handles
+    # the disconnection gracefully when the client closes the connection
+    with client.websocket_connect("/ws") as websocket:
+        message = "Message one"
+        websocket.send_text(message)
+        data = websocket.receive_text()
+        assert data == f"Message text was: {message}"
+        message = "Message two"
+        websocket.send_text(message)
+        data = websocket.receive_text()
+        assert data == f"Message text was: {message}"

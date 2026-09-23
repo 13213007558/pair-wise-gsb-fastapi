@@ -30,60 +30,63 @@ def test_main(app: FastAPI):
 
 def test_websocket_with_cookie(app: FastAPI):
     client = TestClient(app, cookies={"session": "fakesession"})
-    with pytest.raises(WebSocketDisconnect):
-        with client.websocket_connect("/items/foo/ws") as websocket:
-            message = "Message one"
-            websocket.send_text(message)
-            data = websocket.receive_text()
-            assert data == "Session cookie or query token value is: fakesession"
-            data = websocket.receive_text()
-            assert data == f"Message text was: {message}, for item ID: foo"
-            message = "Message two"
-            websocket.send_text(message)
-            data = websocket.receive_text()
-            assert data == "Session cookie or query token value is: fakesession"
-            data = websocket.receive_text()
-            assert data == f"Message text was: {message}, for item ID: foo"
+    # The endpoint doesn't handle WebSocketDisconnect itself, FastAPI handles
+    # the disconnection gracefully when the client closes the connection
+    with client.websocket_connect("/items/foo/ws") as websocket:
+        message = "Message one"
+        websocket.send_text(message)
+        data = websocket.receive_text()
+        assert data == "Session cookie or query token value is: fakesession"
+        data = websocket.receive_text()
+        assert data == f"Message text was: {message}, for item ID: foo"
+        message = "Message two"
+        websocket.send_text(message)
+        data = websocket.receive_text()
+        assert data == "Session cookie or query token value is: fakesession"
+        data = websocket.receive_text()
+        assert data == f"Message text was: {message}, for item ID: foo"
 
 
 def test_websocket_with_header(app: FastAPI):
     client = TestClient(app)
-    with pytest.raises(WebSocketDisconnect):
-        with client.websocket_connect("/items/bar/ws?token=some-token") as websocket:
-            message = "Message one"
-            websocket.send_text(message)
-            data = websocket.receive_text()
-            assert data == "Session cookie or query token value is: some-token"
-            data = websocket.receive_text()
-            assert data == f"Message text was: {message}, for item ID: bar"
-            message = "Message two"
-            websocket.send_text(message)
-            data = websocket.receive_text()
-            assert data == "Session cookie or query token value is: some-token"
-            data = websocket.receive_text()
-            assert data == f"Message text was: {message}, for item ID: bar"
+    # The endpoint doesn't handle WebSocketDisconnect itself, FastAPI handles
+    # the disconnection gracefully when the client closes the connection
+    with client.websocket_connect("/items/bar/ws?token=some-token") as websocket:
+        message = "Message one"
+        websocket.send_text(message)
+        data = websocket.receive_text()
+        assert data == "Session cookie or query token value is: some-token"
+        data = websocket.receive_text()
+        assert data == f"Message text was: {message}, for item ID: bar"
+        message = "Message two"
+        websocket.send_text(message)
+        data = websocket.receive_text()
+        assert data == "Session cookie or query token value is: some-token"
+        data = websocket.receive_text()
+        assert data == f"Message text was: {message}, for item ID: bar"
 
 
 def test_websocket_with_header_and_query(app: FastAPI):
     client = TestClient(app)
-    with pytest.raises(WebSocketDisconnect):
-        with client.websocket_connect("/items/2/ws?q=3&token=some-token") as websocket:
-            message = "Message one"
-            websocket.send_text(message)
-            data = websocket.receive_text()
-            assert data == "Session cookie or query token value is: some-token"
-            data = websocket.receive_text()
-            assert data == "Query parameter q is: 3"
-            data = websocket.receive_text()
-            assert data == f"Message text was: {message}, for item ID: 2"
-            message = "Message two"
-            websocket.send_text(message)
-            data = websocket.receive_text()
-            assert data == "Session cookie or query token value is: some-token"
-            data = websocket.receive_text()
-            assert data == "Query parameter q is: 3"
-            data = websocket.receive_text()
-            assert data == f"Message text was: {message}, for item ID: 2"
+    # The endpoint doesn't handle WebSocketDisconnect itself, FastAPI handles
+    # the disconnection gracefully when the client closes the connection
+    with client.websocket_connect("/items/2/ws?q=3&token=some-token") as websocket:
+        message = "Message one"
+        websocket.send_text(message)
+        data = websocket.receive_text()
+        assert data == "Session cookie or query token value is: some-token"
+        data = websocket.receive_text()
+        assert data == "Query parameter q is: 3"
+        data = websocket.receive_text()
+        assert data == f"Message text was: {message}, for item ID: 2"
+        message = "Message two"
+        websocket.send_text(message)
+        data = websocket.receive_text()
+        assert data == "Session cookie or query token value is: some-token"
+        data = websocket.receive_text()
+        assert data == "Query parameter q is: 3"
+        data = websocket.receive_text()
+        assert data == f"Message text was: {message}, for item ID: 2"
 
 
 def test_websocket_no_credentials(app: FastAPI):
