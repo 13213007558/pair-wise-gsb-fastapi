@@ -36,6 +36,7 @@ from fastapi.openapi.constants import METHODS_WITH_BODY, REF_PREFIX
 from fastapi.openapi.models import OpenAPI
 from fastapi.params import Body, ParamTypes
 from fastapi.responses import Response
+from fastapi.security.requirement import SecurityRequirement
 from fastapi.sse import _SSE_EVENT_SCHEMA
 from fastapi.types import DependencyCacheKey, ModelNameMap
 from fastapi.utils import (
@@ -153,6 +154,43 @@ def _get_openapi_security_definitions(
     operation_security = [
         {name: scopes} for name, scopes in operation_security_dict.items()
     ]
+    return security_definitions, operation_security
+
+
+def _get_openapi_security_requirements(
+    security_requirements: Sequence[SecurityRequirement],
+) -> tuple[dict[str, Any], list[dict[str, Any]]]:
+    security_definitions: dict[str, Any] = {}
+    operation_security: list[dict[str, Any]] = []
+    for requirement in security_requirements:
+        requirement_item: dict[str, Any] = {}
+        for scheme in requirement.schemes:
+            if isinstance(scheme, str):
+                security_name = scheme
+            else:
+                security_name = scheme.scheme_name
+                security_definition = jsonable_encoder(
+                    scheme.model,
+                    by_alias=True,
+                    exclude_none=True,
+                )
+                existing_definition = security_definitions.get(security_name)
+                if (
+                    existing_definition is not None
+                    and existing_definition != security_definition
+                ):
+                    raise ValueError(
+                        f"Conflicting definitions for security scheme "
+                        f"{security_name!r} in the security requirements of "
+                        "the same *path operation*. The same scheme name is "
+                        "declared with different definitions, use a "
+                        "different `scheme_name` for each distinct scheme."
+                    )
+                security_definitions[security_name] = security_definition
+            requirement_item[security_name] = list(
+                requirement.scopes.get(security_name, [])
+            )
+        operation_security.append(requirement_item)
     return security_definitions, operation_security
 
 
@@ -342,7 +380,35 @@ def get_openapi_path(
                     security_dependencies=dependency_data.security_dependencies
                 )
             )
-            if operation_security:
+            security_requirements = getattr(route, "security_requirements", None)
+            if security_requirements is not None:
+                # The *path operation* declares its security combinations
+                # explicitly, they replace the ones derived from the security
+                # dependencies (one alternative per scheme).
+                explicit_definitions, operation_security = (
+                    _get_openapi_security_requirements(
+                        security_requirements=security_requirements
+                    )
+                )
+                for name, definition in explicit_definitions.items():
+                    existing_definition = security_definitions.get(name)
+                    if (
+                        existing_definition is not None
+                        and existing_definition != definition
+                    ):
+                        raise ValueError(
+                            f"Conflicting definitions for security scheme "
+                            f"{name!r}: the security requirements of the "
+                            "*path operation* declare it differently from "
+                            "the security dependency with the same "
+                            "`scheme_name`. Use a different `scheme_name` "
+                            "for each distinct scheme."
+                        )
+                    security_definitions[name] = definition
+                # Emit the declared combinations as is, including an empty
+                # list (explicit anonymous access).
+                operation["security"] = operation_security
+            elif operation_security:
                 operation.setdefault("security", []).extend(operation_security)
             if security_definitions:
                 security_schemes.update(security_definitions)
@@ -574,6 +640,32 @@ def get_fields_from_routes(
     return flat_models
 
 
+def _validate_security_requirements(
+    *,
+    paths: dict[str, dict[str, Any]],
+    webhook_paths: dict[str, dict[str, Any]],
+    security_scheme_names: set[str],
+) -> None:
+    missing_names: set[str] = set()
+    for path_item in list(paths.values()) + list(webhook_paths.values()):
+        for operation in path_item.values():
+            if not isinstance(operation, dict):
+                continue
+            for requirement in operation.get("security") or []:
+                for security_name in requirement:
+                    if security_name not in security_scheme_names:
+                        missing_names.add(security_name)
+    if missing_names:
+        raise ValueError(
+            "Security requirements reference security schemes that are not "
+            f"defined: {sorted(missing_names)}. Declare the scheme with a "
+            "security dependency (e.g. `Security(...)`), or pass the scheme "
+            "instance to `SecurityRequirement` so its definition is "
+            "registered. Currently defined security schemes: "
+            f"{sorted(security_scheme_names)}."
+        )
+
+
 def get_openapi(
     *,
     title: str,
@@ -659,6 +751,11 @@ def get_openapi(
                     definitions.update(path_definitions)
     if definitions:
         components["schemas"] = {k: definitions[k] for k in sorted(definitions)}
+    _validate_security_requirements(
+        paths=paths,
+        webhook_paths=webhook_paths,
+        security_scheme_names=set(components.get("securitySchemes", {})),
+    )
     if components:
         output["components"] = components
     output["paths"] = paths

@@ -25,6 +25,7 @@ from fastapi.openapi.docs import (
 )
 from fastapi.openapi.utils import get_openapi
 from fastapi.params import Depends
+from fastapi.security.requirement import SecurityRequirement
 from fastapi.telemetry import TelemetryConfig
 from fastapi.telemetry._asgi import (
     ExceptionTelemetryMiddleware,
@@ -1230,6 +1231,7 @@ class FastAPI(Starlette):
         response_class: type[Response] | DefaultPlaceholder = Default(JSONResponse),
         name: str | None = None,
         openapi_extra: dict[str, Any] | None = None,
+        security: Sequence[SecurityRequirement] | None = None,
         generate_unique_id_function: Callable[[routing.APIRoute], str] = Default(
             generate_unique_id
         ),
@@ -1258,6 +1260,7 @@ class FastAPI(Starlette):
             response_class=response_class,
             name=name,
             openapi_extra=openapi_extra,
+            security=security,
             generate_unique_id_function=generate_unique_id_function,
         )
 
@@ -1365,6 +1368,7 @@ class FastAPI(Starlette):
         response_class: type[Response] = Default(JSONResponse),
         name: str | None = None,
         openapi_extra: dict[str, Any] | None = None,
+        security: Sequence[SecurityRequirement] | None = None,
         generate_unique_id_function: Callable[[routing.APIRoute], str] = Default(
             generate_unique_id
         ),
@@ -1394,6 +1398,7 @@ class FastAPI(Starlette):
                 response_class=response_class,
                 name=name,
                 openapi_extra=openapi_extra,
+                security=security,
                 generate_unique_id_function=generate_unique_id_function,
             )
             return func
@@ -2001,6 +2006,26 @@ class FastAPI(Starlette):
                 """
             ),
         ] = None,
+        security: Annotated[
+            Sequence[SecurityRequirement] | None,
+            Doc(
+                """
+                Explicit OpenAPI security requirements for this *path
+                operation*, declaring how the security schemes combine.
+
+                Each `SecurityRequirement` in the list is a group of schemes
+                that must all be satisfied together (logical AND), the items
+                of the list are alternatives (logical OR).
+
+                This only shapes the generated OpenAPI document, it doesn't
+                enforce authentication at runtime: keep using `Security()` /
+                `Depends()` dependencies for that. If not set, the security
+                requirements are derived from the security dependencies, one
+                alternative per scheme. Pass an empty list to explicitly
+                allow anonymous access.
+                """
+            ),
+        ] = None,
         generate_unique_id_function: Annotated[
             Callable[[routing.APIRoute], str],
             Doc(
@@ -2055,6 +2080,7 @@ class FastAPI(Starlette):
             name=name,
             callbacks=callbacks,
             openapi_extra=openapi_extra,
+            security=security,
             generate_unique_id_function=generate_unique_id_function,
         )
 
@@ -2374,6 +2400,26 @@ class FastAPI(Starlette):
                 """
             ),
         ] = None,
+        security: Annotated[
+            Sequence[SecurityRequirement] | None,
+            Doc(
+                """
+                Explicit OpenAPI security requirements for this *path
+                operation*, declaring how the security schemes combine.
+
+                Each `SecurityRequirement` in the list is a group of schemes
+                that must all be satisfied together (logical AND), the items
+                of the list are alternatives (logical OR).
+
+                This only shapes the generated OpenAPI document, it doesn't
+                enforce authentication at runtime: keep using `Security()` /
+                `Depends()` dependencies for that. If not set, the security
+                requirements are derived from the security dependencies, one
+                alternative per scheme. Pass an empty list to explicitly
+                allow anonymous access.
+                """
+            ),
+        ] = None,
         generate_unique_id_function: Annotated[
             Callable[[routing.APIRoute], str],
             Doc(
@@ -2433,6 +2479,7 @@ class FastAPI(Starlette):
             name=name,
             callbacks=callbacks,
             openapi_extra=openapi_extra,
+            security=security,
             generate_unique_id_function=generate_unique_id_function,
         )
 
@@ -2752,6 +2799,26 @@ class FastAPI(Starlette):
                 """
             ),
         ] = None,
+        security: Annotated[
+            Sequence[SecurityRequirement] | None,
+            Doc(
+                """
+                Explicit OpenAPI security requirements for this *path
+                operation*, declaring how the security schemes combine.
+
+                Each `SecurityRequirement` in the list is a group of schemes
+                that must all be satisfied together (logical AND), the items
+                of the list are alternatives (logical OR).
+
+                This only shapes the generated OpenAPI document, it doesn't
+                enforce authentication at runtime: keep using `Security()` /
+                `Depends()` dependencies for that. If not set, the security
+                requirements are derived from the security dependencies, one
+                alternative per scheme. Pass an empty list to explicitly
+                allow anonymous access.
+                """
+            ),
+        ] = None,
         generate_unique_id_function: Annotated[
             Callable[[routing.APIRoute], str],
             Doc(
@@ -2811,6 +2878,7 @@ class FastAPI(Starlette):
             name=name,
             callbacks=callbacks,
             openapi_extra=openapi_extra,
+            security=security,
             generate_unique_id_function=generate_unique_id_function,
         )
 
@@ -3130,6 +3198,26 @@ class FastAPI(Starlette):
                 """
             ),
         ] = None,
+        security: Annotated[
+            Sequence[SecurityRequirement] | None,
+            Doc(
+                """
+                Explicit OpenAPI security requirements for this *path
+                operation*, declaring how the security schemes combine.
+
+                Each `SecurityRequirement` in the list is a group of schemes
+                that must all be satisfied together (logical AND), the items
+                of the list are alternatives (logical OR).
+
+                This only shapes the generated OpenAPI document, it doesn't
+                enforce authentication at runtime: keep using `Security()` /
+                `Depends()` dependencies for that. If not set, the security
+                requirements are derived from the security dependencies, one
+                alternative per scheme. Pass an empty list to explicitly
+                allow anonymous access.
+                """
+            ),
+        ] = None,
         generate_unique_id_function: Annotated[
             Callable[[routing.APIRoute], str],
             Doc(
@@ -3184,6 +3272,7 @@ class FastAPI(Starlette):
             name=name,
             callbacks=callbacks,
             openapi_extra=openapi_extra,
+            security=security,
             generate_unique_id_function=generate_unique_id_function,
         )
 
@@ -3503,6 +3592,26 @@ class FastAPI(Starlette):
                 """
             ),
         ] = None,
+        security: Annotated[
+            Sequence[SecurityRequirement] | None,
+            Doc(
+                """
+                Explicit OpenAPI security requirements for this *path
+                operation*, declaring how the security schemes combine.
+
+                Each `SecurityRequirement` in the list is a group of schemes
+                that must all be satisfied together (logical AND), the items
+                of the list are alternatives (logical OR).
+
+                This only shapes the generated OpenAPI document, it doesn't
+                enforce authentication at runtime: keep using `Security()` /
+                `Depends()` dependencies for that. If not set, the security
+                requirements are derived from the security dependencies, one
+                alternative per scheme. Pass an empty list to explicitly
+                allow anonymous access.
+                """
+            ),
+        ] = None,
         generate_unique_id_function: Annotated[
             Callable[[routing.APIRoute], str],
             Doc(
@@ -3557,6 +3666,7 @@ class FastAPI(Starlette):
             name=name,
             callbacks=callbacks,
             openapi_extra=openapi_extra,
+            security=security,
             generate_unique_id_function=generate_unique_id_function,
         )
 
@@ -3876,6 +3986,26 @@ class FastAPI(Starlette):
                 """
             ),
         ] = None,
+        security: Annotated[
+            Sequence[SecurityRequirement] | None,
+            Doc(
+                """
+                Explicit OpenAPI security requirements for this *path
+                operation*, declaring how the security schemes combine.
+
+                Each `SecurityRequirement` in the list is a group of schemes
+                that must all be satisfied together (logical AND), the items
+                of the list are alternatives (logical OR).
+
+                This only shapes the generated OpenAPI document, it doesn't
+                enforce authentication at runtime: keep using `Security()` /
+                `Depends()` dependencies for that. If not set, the security
+                requirements are derived from the security dependencies, one
+                alternative per scheme. Pass an empty list to explicitly
+                allow anonymous access.
+                """
+            ),
+        ] = None,
         generate_unique_id_function: Annotated[
             Callable[[routing.APIRoute], str],
             Doc(
@@ -3930,6 +4060,7 @@ class FastAPI(Starlette):
             name=name,
             callbacks=callbacks,
             openapi_extra=openapi_extra,
+            security=security,
             generate_unique_id_function=generate_unique_id_function,
         )
 
@@ -4249,6 +4380,26 @@ class FastAPI(Starlette):
                 """
             ),
         ] = None,
+        security: Annotated[
+            Sequence[SecurityRequirement] | None,
+            Doc(
+                """
+                Explicit OpenAPI security requirements for this *path
+                operation*, declaring how the security schemes combine.
+
+                Each `SecurityRequirement` in the list is a group of schemes
+                that must all be satisfied together (logical AND), the items
+                of the list are alternatives (logical OR).
+
+                This only shapes the generated OpenAPI document, it doesn't
+                enforce authentication at runtime: keep using `Security()` /
+                `Depends()` dependencies for that. If not set, the security
+                requirements are derived from the security dependencies, one
+                alternative per scheme. Pass an empty list to explicitly
+                allow anonymous access.
+                """
+            ),
+        ] = None,
         generate_unique_id_function: Annotated[
             Callable[[routing.APIRoute], str],
             Doc(
@@ -4308,6 +4459,7 @@ class FastAPI(Starlette):
             name=name,
             callbacks=callbacks,
             openapi_extra=openapi_extra,
+            security=security,
             generate_unique_id_function=generate_unique_id_function,
         )
 
@@ -4627,6 +4779,26 @@ class FastAPI(Starlette):
                 """
             ),
         ] = None,
+        security: Annotated[
+            Sequence[SecurityRequirement] | None,
+            Doc(
+                """
+                Explicit OpenAPI security requirements for this *path
+                operation*, declaring how the security schemes combine.
+
+                Each `SecurityRequirement` in the list is a group of schemes
+                that must all be satisfied together (logical AND), the items
+                of the list are alternatives (logical OR).
+
+                This only shapes the generated OpenAPI document, it doesn't
+                enforce authentication at runtime: keep using `Security()` /
+                `Depends()` dependencies for that. If not set, the security
+                requirements are derived from the security dependencies, one
+                alternative per scheme. Pass an empty list to explicitly
+                allow anonymous access.
+                """
+            ),
+        ] = None,
         generate_unique_id_function: Annotated[
             Callable[[routing.APIRoute], str],
             Doc(
@@ -4681,6 +4853,7 @@ class FastAPI(Starlette):
             name=name,
             callbacks=callbacks,
             openapi_extra=openapi_extra,
+            security=security,
             generate_unique_id_function=generate_unique_id_function,
         )
 

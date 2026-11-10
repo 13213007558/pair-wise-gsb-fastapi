@@ -75,6 +75,7 @@ from fastapi.exceptions import (
     ResponseValidationError,
     WebSocketRequestValidationError,
 )
+from fastapi.security.requirement import SecurityRequirement
 from fastapi.sse import (
     _PING_INTERVAL,
     KEEPALIVE_COMMENT,
@@ -988,6 +989,7 @@ class _APIRouteLike(Protocol):
     dependency_overrides_provider: Any | None
     callbacks: list[BaseRoute] | None
     openapi_extra: dict[str, Any] | None
+    security_requirements: list[SecurityRequirement] | None
     generate_unique_id_function: Callable[[Any], str] | DefaultPlaceholder
     strict_content_type: bool | DefaultPlaceholder
     tags: list[str | Enum]
@@ -1039,6 +1041,7 @@ def _populate_api_route_state(
     dependency_overrides_provider: Any | None = None,
     callbacks: list[BaseRoute] | None = None,
     openapi_extra: dict[str, Any] | None = None,
+    security: Sequence[SecurityRequirement] | None = None,
     generate_unique_id_function: Callable[[Any], str] | DefaultPlaceholder = Default(
         generate_unique_id
     ),
@@ -1063,6 +1066,7 @@ def _populate_api_route_state(
     route.dependency_overrides_provider = dependency_overrides_provider
     route.callbacks = callbacks
     route.openapi_extra = openapi_extra
+    route.security_requirements = list(security) if security is not None else None
     route.generate_unique_id_function = generate_unique_id_function
     route.strict_content_type = strict_content_type
     route.tags = tags or []
@@ -1194,6 +1198,7 @@ class APIRoute(routing.Route):
     dependency_overrides_provider: Any | None
     callbacks: list[BaseRoute] | None
     openapi_extra: dict[str, Any] | None
+    security_requirements: list[SecurityRequirement] | None
     generate_unique_id_function: Callable[[Any], str] | DefaultPlaceholder
     strict_content_type: bool | DefaultPlaceholder
     tags: list[str | Enum]
@@ -1239,6 +1244,7 @@ class APIRoute(routing.Route):
         dependency_overrides_provider: Any | None = None,
         callbacks: list[BaseRoute] | None = None,
         openapi_extra: dict[str, Any] | None = None,
+        security: Sequence[SecurityRequirement] | None = None,
         generate_unique_id_function: Callable[["APIRoute"], str]
         | DefaultPlaceholder = Default(generate_unique_id),
         strict_content_type: bool | DefaultPlaceholder = Default(True),
@@ -1270,6 +1276,7 @@ class APIRoute(routing.Route):
             dependency_overrides_provider=dependency_overrides_provider,
             callbacks=callbacks,
             openapi_extra=openapi_extra,
+            security=security,
             generate_unique_id_function=generate_unique_id_function,
             strict_content_type=strict_content_type,
         )
@@ -1446,6 +1453,7 @@ class _EffectiveRouteContext:
     dependency_overrides_provider: Any | None = None
     callbacks: list[BaseRoute] | None = None
     openapi_extra: dict[str, Any] | None = None
+    security_requirements: list[SecurityRequirement] | None = None
     generate_unique_id_function: Callable[[Any], str] | DefaultPlaceholder = field(
         default_factory=lambda: Default(generate_unique_id)
     )
@@ -1513,6 +1521,7 @@ class _EffectiveRouteContext:
             dependency_overrides_provider=include_context.dependency_overrides_provider,
             callbacks=[*include_context.callbacks, *(route.callbacks or [])],
             openapi_extra=route.openapi_extra,
+            security=route.security_requirements,
             generate_unique_id_function=get_value_or_default(
                 route.generate_unique_id_function,
                 include_context.included_router.generate_unique_id_function,
@@ -3019,6 +3028,7 @@ class APIRouter(routing.Router):
         route_class_override: type[APIRoute] | None = None,
         callbacks: list[BaseRoute] | None = None,
         openapi_extra: dict[str, Any] | None = None,
+        security: Sequence[SecurityRequirement] | None = None,
         generate_unique_id_function: Callable[[APIRoute], str]
         | DefaultPlaceholder = Default(generate_unique_id),
         strict_content_type: bool | DefaultPlaceholder = Default(True),
@@ -3067,6 +3077,7 @@ class APIRouter(routing.Router):
             dependency_overrides_provider=self.dependency_overrides_provider,
             callbacks=current_callbacks,
             openapi_extra=openapi_extra,
+            security=security,
             generate_unique_id_function=current_generate_unique_id,
             strict_content_type=get_value_or_default(
                 strict_content_type, self.strict_content_type
@@ -3101,6 +3112,7 @@ class APIRouter(routing.Router):
         name: str | None = None,
         callbacks: list[BaseRoute] | None = None,
         openapi_extra: dict[str, Any] | None = None,
+        security: Sequence[SecurityRequirement] | None = None,
         generate_unique_id_function: Callable[[APIRoute], str] = Default(
             generate_unique_id
         ),
@@ -3131,6 +3143,7 @@ class APIRouter(routing.Router):
                 name=name,
                 callbacks=callbacks,
                 openapi_extra=openapi_extra,
+                security=security,
                 generate_unique_id_function=generate_unique_id_function,
             )
             return func
@@ -3740,6 +3753,26 @@ class APIRouter(routing.Router):
                 """
             ),
         ] = None,
+        security: Annotated[
+            Sequence[SecurityRequirement] | None,
+            Doc(
+                """
+                Explicit OpenAPI security requirements for this *path
+                operation*, declaring how the security schemes combine.
+
+                Each `SecurityRequirement` in the list is a group of schemes
+                that must all be satisfied together (logical AND), the items
+                of the list are alternatives (logical OR).
+
+                This only shapes the generated OpenAPI document, it doesn't
+                enforce authentication at runtime: keep using `Security()` /
+                `Depends()` dependencies for that. If not set, the security
+                requirements are derived from the security dependencies, one
+                alternative per scheme. Pass an empty list to explicitly
+                allow anonymous access.
+                """
+            ),
+        ] = None,
         generate_unique_id_function: Annotated[
             Callable[[APIRoute], str],
             Doc(
@@ -3798,6 +3831,7 @@ class APIRouter(routing.Router):
             name=name,
             callbacks=callbacks,
             openapi_extra=openapi_extra,
+            security=security,
             generate_unique_id_function=generate_unique_id_function,
         )
 
@@ -4117,6 +4151,26 @@ class APIRouter(routing.Router):
                 """
             ),
         ] = None,
+        security: Annotated[
+            Sequence[SecurityRequirement] | None,
+            Doc(
+                """
+                Explicit OpenAPI security requirements for this *path
+                operation*, declaring how the security schemes combine.
+
+                Each `SecurityRequirement` in the list is a group of schemes
+                that must all be satisfied together (logical AND), the items
+                of the list are alternatives (logical OR).
+
+                This only shapes the generated OpenAPI document, it doesn't
+                enforce authentication at runtime: keep using `Security()` /
+                `Depends()` dependencies for that. If not set, the security
+                requirements are derived from the security dependencies, one
+                alternative per scheme. Pass an empty list to explicitly
+                allow anonymous access.
+                """
+            ),
+        ] = None,
         generate_unique_id_function: Annotated[
             Callable[[APIRoute], str],
             Doc(
@@ -4180,6 +4234,7 @@ class APIRouter(routing.Router):
             name=name,
             callbacks=callbacks,
             openapi_extra=openapi_extra,
+            security=security,
             generate_unique_id_function=generate_unique_id_function,
         )
 
@@ -4499,6 +4554,26 @@ class APIRouter(routing.Router):
                 """
             ),
         ] = None,
+        security: Annotated[
+            Sequence[SecurityRequirement] | None,
+            Doc(
+                """
+                Explicit OpenAPI security requirements for this *path
+                operation*, declaring how the security schemes combine.
+
+                Each `SecurityRequirement` in the list is a group of schemes
+                that must all be satisfied together (logical AND), the items
+                of the list are alternatives (logical OR).
+
+                This only shapes the generated OpenAPI document, it doesn't
+                enforce authentication at runtime: keep using `Security()` /
+                `Depends()` dependencies for that. If not set, the security
+                requirements are derived from the security dependencies, one
+                alternative per scheme. Pass an empty list to explicitly
+                allow anonymous access.
+                """
+            ),
+        ] = None,
         generate_unique_id_function: Annotated[
             Callable[[APIRoute], str],
             Doc(
@@ -4562,6 +4637,7 @@ class APIRouter(routing.Router):
             name=name,
             callbacks=callbacks,
             openapi_extra=openapi_extra,
+            security=security,
             generate_unique_id_function=generate_unique_id_function,
         )
 
@@ -4881,6 +4957,26 @@ class APIRouter(routing.Router):
                 """
             ),
         ] = None,
+        security: Annotated[
+            Sequence[SecurityRequirement] | None,
+            Doc(
+                """
+                Explicit OpenAPI security requirements for this *path
+                operation*, declaring how the security schemes combine.
+
+                Each `SecurityRequirement` in the list is a group of schemes
+                that must all be satisfied together (logical AND), the items
+                of the list are alternatives (logical OR).
+
+                This only shapes the generated OpenAPI document, it doesn't
+                enforce authentication at runtime: keep using `Security()` /
+                `Depends()` dependencies for that. If not set, the security
+                requirements are derived from the security dependencies, one
+                alternative per scheme. Pass an empty list to explicitly
+                allow anonymous access.
+                """
+            ),
+        ] = None,
         generate_unique_id_function: Annotated[
             Callable[[APIRoute], str],
             Doc(
@@ -4939,6 +5035,7 @@ class APIRouter(routing.Router):
             name=name,
             callbacks=callbacks,
             openapi_extra=openapi_extra,
+            security=security,
             generate_unique_id_function=generate_unique_id_function,
         )
 
@@ -5258,6 +5355,26 @@ class APIRouter(routing.Router):
                 """
             ),
         ] = None,
+        security: Annotated[
+            Sequence[SecurityRequirement] | None,
+            Doc(
+                """
+                Explicit OpenAPI security requirements for this *path
+                operation*, declaring how the security schemes combine.
+
+                Each `SecurityRequirement` in the list is a group of schemes
+                that must all be satisfied together (logical AND), the items
+                of the list are alternatives (logical OR).
+
+                This only shapes the generated OpenAPI document, it doesn't
+                enforce authentication at runtime: keep using `Security()` /
+                `Depends()` dependencies for that. If not set, the security
+                requirements are derived from the security dependencies, one
+                alternative per scheme. Pass an empty list to explicitly
+                allow anonymous access.
+                """
+            ),
+        ] = None,
         generate_unique_id_function: Annotated[
             Callable[[APIRoute], str],
             Doc(
@@ -5316,6 +5433,7 @@ class APIRouter(routing.Router):
             name=name,
             callbacks=callbacks,
             openapi_extra=openapi_extra,
+            security=security,
             generate_unique_id_function=generate_unique_id_function,
         )
 
@@ -5635,6 +5753,26 @@ class APIRouter(routing.Router):
                 """
             ),
         ] = None,
+        security: Annotated[
+            Sequence[SecurityRequirement] | None,
+            Doc(
+                """
+                Explicit OpenAPI security requirements for this *path
+                operation*, declaring how the security schemes combine.
+
+                Each `SecurityRequirement` in the list is a group of schemes
+                that must all be satisfied together (logical AND), the items
+                of the list are alternatives (logical OR).
+
+                This only shapes the generated OpenAPI document, it doesn't
+                enforce authentication at runtime: keep using `Security()` /
+                `Depends()` dependencies for that. If not set, the security
+                requirements are derived from the security dependencies, one
+                alternative per scheme. Pass an empty list to explicitly
+                allow anonymous access.
+                """
+            ),
+        ] = None,
         generate_unique_id_function: Annotated[
             Callable[[APIRoute], str],
             Doc(
@@ -5698,6 +5836,7 @@ class APIRouter(routing.Router):
             name=name,
             callbacks=callbacks,
             openapi_extra=openapi_extra,
+            security=security,
             generate_unique_id_function=generate_unique_id_function,
         )
 
@@ -6017,6 +6156,26 @@ class APIRouter(routing.Router):
                 """
             ),
         ] = None,
+        security: Annotated[
+            Sequence[SecurityRequirement] | None,
+            Doc(
+                """
+                Explicit OpenAPI security requirements for this *path
+                operation*, declaring how the security schemes combine.
+
+                Each `SecurityRequirement` in the list is a group of schemes
+                that must all be satisfied together (logical AND), the items
+                of the list are alternatives (logical OR).
+
+                This only shapes the generated OpenAPI document, it doesn't
+                enforce authentication at runtime: keep using `Security()` /
+                `Depends()` dependencies for that. If not set, the security
+                requirements are derived from the security dependencies, one
+                alternative per scheme. Pass an empty list to explicitly
+                allow anonymous access.
+                """
+            ),
+        ] = None,
         generate_unique_id_function: Annotated[
             Callable[[APIRoute], str],
             Doc(
@@ -6080,6 +6239,7 @@ class APIRouter(routing.Router):
             name=name,
             callbacks=callbacks,
             openapi_extra=openapi_extra,
+            security=security,
             generate_unique_id_function=generate_unique_id_function,
         )
 
@@ -6399,6 +6559,26 @@ class APIRouter(routing.Router):
                 """
             ),
         ] = None,
+        security: Annotated[
+            Sequence[SecurityRequirement] | None,
+            Doc(
+                """
+                Explicit OpenAPI security requirements for this *path
+                operation*, declaring how the security schemes combine.
+
+                Each `SecurityRequirement` in the list is a group of schemes
+                that must all be satisfied together (logical AND), the items
+                of the list are alternatives (logical OR).
+
+                This only shapes the generated OpenAPI document, it doesn't
+                enforce authentication at runtime: keep using `Security()` /
+                `Depends()` dependencies for that. If not set, the security
+                requirements are derived from the security dependencies, one
+                alternative per scheme. Pass an empty list to explicitly
+                allow anonymous access.
+                """
+            ),
+        ] = None,
         generate_unique_id_function: Annotated[
             Callable[[APIRoute], str],
             Doc(
@@ -6462,6 +6642,7 @@ class APIRouter(routing.Router):
             name=name,
             callbacks=callbacks,
             openapi_extra=openapi_extra,
+            security=security,
             generate_unique_id_function=generate_unique_id_function,
         )
 
